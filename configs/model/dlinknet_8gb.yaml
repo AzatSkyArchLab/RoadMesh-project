@@ -1,0 +1,78 @@
+# D-LinkNet Configuration
+# Optimized for RTX 3070 Ti 8GB VRAM
+
+model:
+  architecture: dlinknet34
+  input_size: 512
+  num_classes: 1
+  pretrained_backbone: true
+  dropout: 0.2
+  checkpoint_path: null  # Set after training
+
+training:
+  # Batch size для 8GB VRAM
+  # С mixed precision можно использовать 4
+  batch_size: 4
+  
+  # Gradient accumulation для эффективного batch=8
+  gradient_accumulation: 2
+  
+  # Mixed precision (FP16) — экономит ~40% VRAM
+  mixed_precision: true
+  
+  # Gradient checkpointing — ещё ~30% экономии (но медленнее)
+  # Включить если не хватает памяти
+  gradient_checkpointing: false
+  
+  num_workers: 4
+  epochs: 100
+  
+  # Learning rate
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  
+  # Scheduler
+  scheduler_type: cosine
+  warmup_epochs: 5
+  
+  # Early stopping
+  early_stopping_patience: 15
+  early_stopping_min_delta: 0.001
+  
+  # Loss weights
+  bce_weight: 0.5
+  dice_weight: 0.3
+  connectivity_weight: 0.2
+  
+  # Checkpoints
+  checkpoint_dir: ./checkpoints
+  save_top_k: 3
+
+inference:
+  batch_size: 8
+  tile_overlap: 64
+  confidence_threshold: 0.5
+  use_tta: false
+
+geometry:
+  simplify_tolerance: 1.5
+  min_polygon_area: 50.0
+  snap_tolerance: 2.0
+  default_crs: "EPSG:4326"
+  working_crs: "EPSG:3857"
+
+logging:
+  level: INFO
+  format: console
+
+# Мониторинг использования VRAM
+# Ожидаемое использование:
+#   Model weights:     ~150 MB
+#   Gradients:         ~150 MB  
+#   Optimizer states:  ~300 MB (AdamW)
+#   Activations:       ~3-4 GB (batch=4, 512x512)
+#   CUDA overhead:     ~500 MB
+#   --------------------------
+#   Total:             ~4.5-5.5 GB
+#   
+#   Свободно для пиков: ~2.5-3.5 GB ✓

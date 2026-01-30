@@ -1,0 +1,56 @@
+# Moscow Dataset Configuration
+# Small test area for initial experiments
+
+project:
+  name: roadmesh-moscow
+  version: 0.1.0
+
+data:
+  tile_size: 512
+  tile_provider: esri
+  cache_dir: ./data/cache
+  raw_dir: ./data/raw
+  processed_dir: ./data/processed
+  
+  # Центральная Москва (небольшая область для тестов)
+  # ~4x4 км, примерно 100-200 тайлов на zoom=18
+  default_bbox:
+    minx: 37.58
+    miny: 55.73
+    maxx: 37.65
+    maxy: 55.77
+  
+  default_zoom: 18
+  
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  
+  # Пропускать тайлы с малым покрытием дорогами
+  min_road_coverage: 0.02
+  
+  augmentations:
+    horizontal_flip: true
+    vertical_flip: true
+    rotate_90: true
+    rotate_limit: 15
+    brightness_contrast: true
+    brightness_limit: 0.2
+    contrast_limit: 0.2
+    blur_limit: 3
+    noise: true
+
+# Настройки для загрузки тайлов
+tile_fetcher:
+  rate_limit_delay: 0.3  # секунды между запросами к Esri
+  max_retries: 3
+  timeout: 30
+  
+# Векторные данные (твои файлы)
+vectors:
+  roads_path: ./data/raw/moscow_roads.geojson
+  # Колонки в твоих данных (настрой под свои)
+  width_column: null      # или 'width', 'road_width' и т.д.
+  type_column: null       # или 'highway', 'road_type' и т.д.
+  # Ширина дорог по умолчанию (метры)
+  default_road_width: 6.0
