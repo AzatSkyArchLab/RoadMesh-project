@@ -1013,8 +1013,8 @@ async def index():
                     return '<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid #444">' +
                         '<span>' + (isBest ? '⭐ ' : '') + m.name + '<br><small style="color:#666">' + date + ' | ' + m.size_mb.toFixed(1) + 'MB</small></span>' +
                         '<div>' +
-                            (isBest ? '' : '<button onclick="activateModel(\'' + m.name + '\')" style="background:#00d4ff;border:none;color:#000;padding:3px 6px;border-radius:3px;cursor:pointer;margin-right:3px;font-size:10px">Use</button>') +
-                            '<button onclick="deleteModel(\'' + m.name + '\')" style="background:#ff4757;border:none;color:#fff;padding:3px 6px;border-radius:3px;cursor:pointer;font-size:10px">✕</button>' +
+                            (isBest ? '' : '<button onclick="activateModel(\\'' + m.name + '\\')" style="background:#00d4ff;border:none;color:#000;padding:3px 6px;border-radius:3px;cursor:pointer;margin-right:3px;font-size:10px">Use</button>') +
+                            '<button onclick="deleteModel(\\'' + m.name + '\\')" style="background:#ff4757;border:none;color:#fff;padding:3px 6px;border-radius:3px;cursor:pointer;font-size:10px">✕</button>' +
                         '</div>' +
                     '</div>';
                 }).join('');
