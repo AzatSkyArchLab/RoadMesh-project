@@ -155,6 +155,66 @@ async def list_models():
     return {"models": models}
 
 
+@app.delete("/api/models/{model_name}")
+async def delete_model(model_name: str):
+    """Delete a trained model."""
+    models_dir = Path("checkpoints")
+    model_path = models_dir / f"{model_name}.pt"
+
+    if not model_path.exists():
+        return {"error": f"Model not found: {model_name}"}
+
+    try:
+        model_path.unlink()
+        return {"status": "ok", "message": f"Deleted {model_name}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.delete("/api/models")
+async def delete_all_models():
+    """Delete all trained models."""
+    models_dir = Path("checkpoints")
+    deleted = []
+
+    if models_dir.exists():
+        for f in models_dir.glob("*.pt"):
+            try:
+                f.unlink()
+                deleted.append(f.stem)
+            except Exception as e:
+                print(f"Failed to delete {f}: {e}")
+
+    return {"status": "ok", "deleted": deleted, "count": len(deleted)}
+
+
+@app.post("/api/models/{model_name}/activate")
+async def activate_model(model_name: str):
+    """Set a model as the active (best) model for inference."""
+    models_dir = Path("checkpoints")
+    source_path = models_dir / f"{model_name}.pt"
+    best_path = models_dir / "best_model.pt"
+
+    if not source_path.exists():
+        return {"error": f"Model not found: {model_name}"}
+
+    if model_name == "best_model":
+        return {"status": "ok", "message": "Already the active model"}
+
+    try:
+        import shutil
+        # Backup current best if exists
+        if best_path.exists():
+            backup_name = f"best_model_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
+            shutil.copy(best_path, models_dir / backup_name)
+
+        # Copy selected model to best_model
+        shutil.copy(source_path, best_path)
+        return {"status": "ok", "message": f"Activated {model_name} as best_model"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/sources")
 async def list_sources():
     """List available GeoJSON data sources."""
@@ -680,6 +740,16 @@ async def index():
         <label>Epochs:</label>
         <input type="number" id="epochs" value="10" min="1" max="200">
         <button class="btn btn-primary" id="btn-train" disabled>🧠 Train Model</button>
+
+        <h3>📦 MODELS</h3>
+        <div id="models-list" style="background:#2d2d44;border-radius:6px;padding:10px;margin:10px 0;max-height:150px;overflow-y:auto;font-size:12px;">
+            Loading...
+        </div>
+        <div style="display:flex;gap:5px;">
+            <button class="btn" style="background:#444;flex:1;padding:8px;" id="btn-refresh-models">🔄 Refresh</button>
+            <button class="btn btn-danger" style="flex:1;padding:8px;" id="btn-delete-all">🗑️ Delete All</button>
+        </div>
+
         <h3>4. DETECT ROADS</h3>
         <label style="display:flex;align-items:center;margin:5px 0;">
             <input type="checkbox" id="bind-graph" checked style="margin-right:8px;">
@@ -904,6 +974,64 @@ async def index():
                 await loadGroundTruth();
             }
         };
+
+        // Model management
+        const modelsList = document.getElementById('models-list');
+
+        async function loadModels() {
+            try {
+                const resp = await fetch('/api/models');
+                const data = await resp.json();
+                if (data.models.length === 0) {
+                    modelsList.innerHTML = '<span style="color:#888">No models yet. Train one!</span>';
+                    return;
+                }
+                modelsList.innerHTML = data.models.map(m => {
+                    const date = new Date(m.created).toLocaleDateString('ru-RU', {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+                    const isBest = m.name === 'best_model';
+                    return '<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid #444">' +
+                        '<span>' + (isBest ? '⭐ ' : '') + m.name + '<br><small style="color:#666">' + date + ' | ' + m.size_mb.toFixed(1) + 'MB</small></span>' +
+                        '<div>' +
+                            (isBest ? '' : '<button onclick="activateModel(\'' + m.name + '\')" style="background:#00d4ff;border:none;color:#000;padding:3px 6px;border-radius:3px;cursor:pointer;margin-right:3px;font-size:10px">Use</button>') +
+                            '<button onclick="deleteModel(\'' + m.name + '\')" style="background:#ff4757;border:none;color:#fff;padding:3px 6px;border-radius:3px;cursor:pointer;font-size:10px">✕</button>' +
+                        '</div>' +
+                    '</div>';
+                }).join('');
+            } catch(err) {
+                modelsList.innerHTML = '<span style="color:#ff4757">Error loading models</span>';
+            }
+        }
+
+        async function deleteModel(name) {
+            if (!confirm('Delete model "' + name + '"?')) return;
+            await fetch('/api/models/' + name, {method: 'DELETE'});
+            loadModels();
+            setStatus('Model ' + name + ' deleted', 'info');
+        }
+
+        async function activateModel(name) {
+            const resp = await fetch('/api/models/' + name + '/activate', {method: 'POST'});
+            const result = await resp.json();
+            if (result.error) {
+                setStatus('Error: ' + result.error, 'error');
+            } else {
+                setStatus('Model ' + name + ' activated', 'success');
+                loadModels();
+            }
+        }
+
+        document.getElementById('btn-refresh-models').onclick = loadModels;
+
+        document.getElementById('btn-delete-all').onclick = async () => {
+            if (!confirm('Delete ALL models? This cannot be undone!')) return;
+            const resp = await fetch('/api/models', {method: 'DELETE'});
+            const result = await resp.json();
+            setStatus('Deleted ' + result.count + ' models', 'info');
+            loadModels();
+        };
+
+        // Load models on start
+        loadModels();
     </script>
 </body>
 </html>"""
