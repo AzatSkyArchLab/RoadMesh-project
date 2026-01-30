@@ -467,11 +467,12 @@ async def run_inference(job_id: str, request: PredictRequest):
 
         img_resized = cv2.resize(image, (512, 512))
         img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
+        img_tensor = img_tensor.unsqueeze(0).to(device)  # Move to device FIRST
 
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(device)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(device)
+        # Normalize on the same device
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
         img_tensor = (img_tensor - mean) / std
-        img_tensor = img_tensor.unsqueeze(0).to(device)
 
         with torch.no_grad():
             if device == "cuda":
