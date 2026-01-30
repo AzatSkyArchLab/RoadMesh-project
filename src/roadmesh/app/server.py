@@ -773,9 +773,30 @@ async def index():
     <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
     <script>
         const map = L.map('map').setView([55.751244, 37.618423], 14);
-        const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {attribution: 'Esri', maxZoom: 19}).addTo(map);
-        const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {attribution: 'OSM', maxZoom: 19});
-        L.control.layers({"Satellite": satellite, "OpenStreetMap": osm}).addTo(map);
+
+        // Multiple satellite tile sources (use working ones)
+        const googleSat = L.tileLayer('https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
+            attribution: 'Google Satellite', maxZoom: 20
+        });
+        const esriSat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+            attribution: 'Esri', maxZoom: 19
+        });
+        const yandexSat = L.tileLayer('https://sat0{s}.maps.yandex.net/tiles?l=sat&x={x}&y={y}&z={z}', {
+            attribution: 'Yandex', maxZoom: 19, subdomains: '1234'
+        });
+        const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: 'OSM', maxZoom: 19
+        });
+
+        // Use Google Satellite by default (more reliable)
+        googleSat.addTo(map);
+
+        L.control.layers({
+            "Google Satellite": googleSat,
+            "Esri Satellite": esriSat,
+            "Yandex Satellite": yandexSat,
+            "OpenStreetMap": osm
+        }).addTo(map);
 
         const drawnItems = new L.FeatureGroup().addTo(map);
         const drawControl = new L.Control.Draw({
