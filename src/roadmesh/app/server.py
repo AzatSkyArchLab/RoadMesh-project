@@ -475,12 +475,7 @@ async def run_inference(job_id: str, request: PredictRequest):
         img_tensor = (img_tensor - mean) / std
 
         with torch.no_grad():
-            if device == "cuda":
-                with torch.cuda.amp.autocast():
-                    output = model(img_tensor)
-            else:
-                output = model(img_tensor)
-
+            output = model(img_tensor)
             pred = torch.sigmoid(output).squeeze().cpu().numpy()
             mask = (pred > 0.5).astype(np.uint8)
 
