@@ -41,13 +41,13 @@ class Trainer:
         self.config = config
         self.device = device
         self.experiment_name = experiment_name or f"exp_{int(time.time())}"
-        
-        # Loss function
+
+        # Loss function (must be on same device as model!)
         self.criterion = CombinedLoss(
             bce_weight=config.bce_weight,
             dice_weight=config.dice_weight,
             connectivity_weight=config.connectivity_weight,
-        )
+        ).to(device)  # Move loss to device for ConnectivityLoss buffers
         
         # Optimizer
         self.optimizer = torch.optim.AdamW(
