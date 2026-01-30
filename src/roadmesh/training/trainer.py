@@ -63,6 +63,8 @@ class Trainer:
         self.scaler = GradScaler() if config.mixed_precision else None
         
         # Checkpoint directory
+        self.root_checkpoint_dir = config.checkpoint_dir  # For best_model.pt
+        self.root_checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_dir = config.checkpoint_dir / self.experiment_name
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
@@ -255,10 +257,13 @@ class Trainer:
         
         path = self.checkpoint_dir / filename
         torch.save(checkpoint, path)
-        
+
         if is_best:
-            best_path = self.checkpoint_dir / "best_model.pt"
+            # Save best_model.pt to ROOT checkpoint dir (not experiment subdir)
+            # so that prediction can find it at checkpoints/best_model.pt
+            best_path = self.root_checkpoint_dir / "best_model.pt"
             torch.save(checkpoint, best_path)
+            print(f"Saved best model to {best_path}")
     
     def load_checkpoint(self, path: Path):
         """Load training checkpoint."""
