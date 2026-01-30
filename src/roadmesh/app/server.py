@@ -548,9 +548,19 @@ async def run_inference(job_id: str, request: PredictRequest):
 
         print(f"[PREDICT] Mask shape: {mask.shape}, road pixels: {mask.sum()}")
 
+        # Debug: save mask image
+        debug_dir = Path("data/debug")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(debug_dir / f"{job_id}_mask.png"), mask * 255)
+        cv2.imwrite(str(debug_dir / f"{job_id}_pred.png"), (pred * 255).astype(np.uint8))
+        print(f"[PREDICT] Debug masks saved to {debug_dir}")
+
         await update(70, "Vectorizing results...")
 
-        vectorizer = Vectorizer()
+        # Use lower min_polygon_area for better detection
+        from roadmesh.core.config import GeometryConfig
+        geo_config = GeometryConfig(min_polygon_area=10.0, simplify_tolerance=1.0)
+        vectorizer = Vectorizer(config=geo_config)
         polygons_px = vectorizer.mask_to_polygons(mask * 255)
 
         print(f"[PREDICT] Found {len(polygons_px)} polygons")
