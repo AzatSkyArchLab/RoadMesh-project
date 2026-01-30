@@ -468,14 +468,20 @@ async def run_inference(job_id: str, request: PredictRequest):
 
         img_resized = cv2.resize(image, (512, 512))
         img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
-        img_tensor = img_tensor.unsqueeze(0).to(device)  # Move to device FIRST
+        img_tensor = img_tensor.unsqueeze(0).to(device=device, dtype=torch.float32)
 
-        # Normalize on the same device
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
+        # Normalize on the same device with explicit float32
+        mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, device=device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, device=device).view(1, 3, 1, 1)
         img_tensor = (img_tensor - mean) / std
 
-        with torch.no_grad():
+        # Ensure input is float32 (not half precision)
+        img_tensor = img_tensor.float()
+        print(f"[PREDICT] Input tensor dtype: {img_tensor.dtype}, device: {img_tensor.device}")
+
+        # Disable autocast and ensure float32 inference
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
+            img_tensor = img_tensor.float()  # Ensure float32 even inside context
             output = model(img_tensor)
             pred = torch.sigmoid(output).squeeze().cpu().numpy()
             mask = (pred > 0.5).astype(np.uint8)
