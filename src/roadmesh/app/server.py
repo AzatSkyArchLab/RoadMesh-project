@@ -453,6 +453,7 @@ async def run_inference(job_id: str, request: PredictRequest):
         print(f"[PREDICT] Loading model from: {model_path}")
 
         model = create_model("dlinknet34", checkpoint_path=str(model_path), device=device)
+        model = model.float()  # Ensure FP32 weights (checkpoint may have FP16 from mixed precision training)
         model.eval()
 
         await update(10, "Fetching satellite tiles...")
