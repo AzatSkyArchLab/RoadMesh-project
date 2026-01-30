@@ -25,6 +25,51 @@ from shapely.geometry import box
 app = FastAPI(title="RoadMesh", version="0.1.0")
 
 
+def detect_roads_by_color(image: np.ndarray) -> np.ndarray:
+    """
+    Detect roads using color-based analysis.
+    Roads are typically gray (asphalt) with low saturation.
+    """
+    # Convert to HSV for better color filtering
+    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+
+    # Gray asphalt roads: low saturation, medium-high value
+    # Saturation < 50, Value between 80-200 (gray tones)
+    lower_gray = np.array([0, 0, 80])
+    upper_gray = np.array([180, 50, 200])
+    mask_gray = cv2.inRange(hsv, lower_gray, upper_gray)
+
+    # Also detect lighter road surfaces
+    lower_light = np.array([0, 0, 150])
+    upper_light = np.array([180, 40, 255])
+    mask_light = cv2.inRange(hsv, lower_light, upper_light)
+
+    # Combine masks
+    mask = cv2.bitwise_or(mask_gray, mask_light)
+
+    # Apply morphological operations to clean up
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # Remove small noise
+    kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_small)
+
+    # Fill holes in road regions
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Filter by area - keep only larger connected regions (likely roads)
+    min_area = 500  # Minimum pixels for a road segment
+    result_mask = np.zeros_like(mask)
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area > min_area:
+            cv2.drawContours(result_mask, [contour], -1, 255, -1)
+
+    return result_mask
+
+
 # Available GeoJSON sources
 GEOJSON_SOURCES = {
     "osi_sush": {
@@ -73,6 +118,7 @@ class PredictRequest(BaseModel):
     model_name: Optional[str] = None
     bind_to_graph: bool = True  # Привязывать детекции к дорожному графу
     source: Optional[str] = None  # Источник данных для привязки
+    detection_mode: str = "color"  # "color" (fast, no ML) or "ml" (requires trained model)
 
 
 # WebSocket for progress updates
@@ -493,58 +539,66 @@ async def run_inference(job_id: str, request: PredictRequest):
             await broadcast({"type": "progress", "job_id": job_id, **state.jobs[job_id]})
             await asyncio.sleep(0.1)
 
-        await update(0, "Loading model...")
+        detection_mode = request.detection_mode or "color"
+        print(f"[PREDICT] Detection mode: {detection_mode}")
 
         from roadmesh.core.config import BBox as BBoxConfig
         from roadmesh.data.tile_fetcher import TileFetcher
-        from roadmesh.models.architectures import create_model
         from roadmesh.geometry.vectorizer import Vectorizer, GraphBinder, MeshBuilder
 
-        model_path = Path("checkpoints/best_model.pt")
-        if request.model_name:
-            model_path = Path(f"checkpoints/{request.model_name}.pt")
-
-        if not model_path.exists():
-            await update(0, "No trained model found. Train first!", "failed")
-            return
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"[PREDICT] Using device: {device}")
-        print(f"[PREDICT] Loading model from: {model_path}")
-
-        model = create_model("dlinknet34", checkpoint_path=str(model_path), device=device)
-        model = model.float()  # Ensure FP32 weights (checkpoint may have FP16 from mixed precision training)
-        model.eval()
-
-        await update(10, "Fetching satellite tiles...")
+        await update(5, "Fetching satellite tiles...")
 
         bbox_config = BBoxConfig(minx=bbox.minx, miny=bbox.miny, maxx=bbox.maxx, maxy=bbox.maxy)
-        fetcher = TileFetcher(provider="esri", cache_dir=Path("data/cache/tiles"))
+        fetcher = TileFetcher(provider="google", cache_dir=Path("data/cache/tiles"))
 
         image, metadata = await fetcher.fetch_bbox_async(bbox_config, zoom=18)
         print(f"[PREDICT] Fetched image: {image.shape}")
 
-        await update(40, "Running inference...")
+        await update(30, "Detecting roads...")
 
-        img_resized = cv2.resize(image, (512, 512))
-        img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
-        img_tensor = img_tensor.unsqueeze(0).to(device=device, dtype=torch.float32)
+        if detection_mode == "color":
+            # Color-based road detection (fast, no ML required)
+            await update(40, "Running color-based detection...")
+            mask = detect_roads_by_color(image)
+            # Resize mask to standard size
+            mask = cv2.resize(mask, (512, 512))
+            mask = (mask > 127).astype(np.uint8)
+            pred = mask.astype(np.float32)
+            print(f"[PREDICT] Color detection complete")
 
-        # Normalize on the same device with explicit float32
-        mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, device=device).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, device=device).view(1, 3, 1, 1)
-        img_tensor = (img_tensor - mean) / std
+        else:
+            # ML-based detection
+            await update(40, "Loading ML model...")
+            from roadmesh.models.architectures import create_model
 
-        # Ensure input is float32 (not half precision)
-        img_tensor = img_tensor.float()
-        print(f"[PREDICT] Input tensor dtype: {img_tensor.dtype}, device: {img_tensor.device}")
+            model_path = Path("checkpoints/best_model.pt")
+            if request.model_name:
+                model_path = Path(f"checkpoints/{request.model_name}.pt")
 
-        # Disable autocast and ensure float32 inference
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
-            img_tensor = img_tensor.float()  # Ensure float32 even inside context
-            output = model(img_tensor)
-            pred = torch.sigmoid(output).squeeze().cpu().numpy()
-            mask = (pred > 0.5).astype(np.uint8)
+            if not model_path.exists():
+                await update(0, "No trained model found. Use color mode or train first!", "failed")
+                return
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"[PREDICT] Using device: {device}")
+            print(f"[PREDICT] Loading model from: {model_path}")
+
+            model = create_model("dlinknet34", checkpoint_path=str(model_path), device=device)
+            model = model.float()
+            model.eval()
+
+            img_resized = cv2.resize(image, (512, 512))
+            img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
+            img_tensor = img_tensor.unsqueeze(0).to(device=device, dtype=torch.float32)
+
+            mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, device=device).view(1, 3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, device=device).view(1, 3, 1, 1)
+            img_tensor = (img_tensor - mean) / std
+
+            with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
+                output = model(img_tensor.float())
+                pred = torch.sigmoid(output).squeeze().cpu().numpy()
+                mask = (pred > 0.5).astype(np.uint8)
 
         print(f"[PREDICT] Mask shape: {mask.shape}, road pixels: {mask.sum()}")
 
@@ -761,6 +815,11 @@ async def index():
         </div>
 
         <h3>4. DETECT ROADS</h3>
+        <label style="font-size:12px;color:#888;">Detection Mode:</label>
+        <select id="detection-mode" class="btn" style="background:#2d2d44;color:white;text-align:left;margin:5px 0;">
+            <option value="color">🎨 Color-based (fast, no training)</option>
+            <option value="ml">🧠 ML Model (requires training)</option>
+        </select>
         <label style="display:flex;align-items:center;margin:5px 0;">
             <input type="checkbox" id="bind-graph" checked style="margin-right:8px;">
             Привязать к дорожному графу
@@ -955,13 +1014,15 @@ async def index():
             setStatus('Starting detection...', 'info');
             const bindToGraph = document.getElementById('bind-graph').checked;
             const source = document.getElementById('source-select').value;
+            const detectionMode = document.getElementById('detection-mode').value;
             await fetch('/api/predict', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
                     bbox: currentBbox,
                     bind_to_graph: bindToGraph,
-                    source: source
+                    source: source,
+                    detection_mode: detectionMode
                 })
             });
         };
