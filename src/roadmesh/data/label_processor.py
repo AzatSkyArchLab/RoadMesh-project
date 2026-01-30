@@ -40,17 +40,23 @@ class LabelProcessor:
         self.config = config or GeometryConfig()
         self.default_road_width = default_road_width
         
-        # Road type to width mapping (meters)
+        # Ширина дорог по СП 42.13330.2016 (метры)
+        # Сопоставление с классификацией kl_gp Москвы
         self.road_widths = {
-            "motorway": 14.0,
-            "trunk": 12.0,
-            "primary": 10.0,
-            "secondary": 8.0,
-            "tertiary": 7.0,
-            "residential": 6.0,
-            "service": 4.0,
-            "footway": 2.0,
-            "path": 1.5,
+            # Магистральные общегородские (4-6 полос × 3.5-3.75 м)
+            "Магистральные улицы общегородского значения I класса": 22.5,           # 6 × 3.75
+            "Магистральные улицы общегородского значения II класса": 14.0,          # 4 × 3.5
+            "Магистральные улицы общегородского значения непрерывного движения": 22.5,  # 6 × 3.75
+            "Магистральные улицы общегородского значения регулируемого движения": 14.0, # 4 × 3.5
+            # Центр (обычно меньше полос)
+            "Магистральные улицы общегородского значения I класса центра": 15.0,    # 4 × 3.75
+            "Магистральные улицы общегородского значения II класса центра": 10.5,   # 3 × 3.5
+            # Районные (2-4 полосы × 3.5 м)
+            "Магистральные улицы районного значения": 10.5,                         # 3 × 3.5
+            "Магистральные улицы районного значения центра": 7.0,                   # 2 × 3.5
+            # Местные (2 полосы × 3.0 м)
+            "Прочая улично-дорожная сеть Москвы": 6.0,                              # 2 × 3.0
+            "без категории": 6.0,                                                   # 2 × 3.0
             "default": 6.0,
         }
     
@@ -99,29 +105,24 @@ class LabelProcessor:
     ) -> gpd.GeoDataFrame:
         """
         Estimate road width for each feature.
-        
-        Args:
-            gdf: GeoDataFrame with road geometries
-            width_column: Column name containing explicit width values
-            type_column: Column name containing road type (for estimation)
-            
-        Returns:
-            GeoDataFrame with 'width' column added
         """
         gdf = gdf.copy()
         
+        # Handle empty GeoDataFrame
+        if gdf.empty:
+            gdf["width"] = []
+            return gdf
+
         if width_column and width_column in gdf.columns:
-            # Use explicit width values
             gdf["width"] = gdf[width_column].fillna(self.default_road_width)
         elif type_column and type_column in gdf.columns:
-            # Estimate from road type
+            # Don't use .lower() - Russian text is case-sensitive
             gdf["width"] = gdf[type_column].map(
-                lambda x: self.road_widths.get(str(x).lower(), self.default_road_width)
+                lambda x: self.road_widths.get(str(x), self.default_road_width)
             )
         else:
-            # Use default width
             gdf["width"] = self.default_road_width
-        
+
         return gdf
     
     def buffer_roads(
