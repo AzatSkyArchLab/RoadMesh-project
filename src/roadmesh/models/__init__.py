@@ -14,6 +14,11 @@ from roadmesh.models.losses import (
     BCEDiceLoss,
     ConnectivityLoss,
 )
+from roadmesh.models.pretrained import (
+    create_pretrained_model,
+    PretrainedRoadSegmentation,
+    list_available_encoders,
+)
 
 __all__ = [
     "create_model",
@@ -23,4 +28,7 @@ __all__ = [
     "DiceLoss",
     "BCEDiceLoss",
     "ConnectivityLoss",
+    "create_pretrained_model",
+    "PretrainedRoadSegmentation",
+    "list_available_encoders",
 ]

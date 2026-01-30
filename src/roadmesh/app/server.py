@@ -603,9 +603,51 @@ async def run_inference(job_id: str, request: PredictRequest):
             pred = mask.astype(np.float32)
             print(f"[PREDICT] Color detection complete")
 
+        elif detection_mode == "pretrained":
+            # Use pretrained segmentation_models_pytorch with ImageNet encoder
+            await update(40, "Loading pretrained model (ImageNet encoder)...")
+            from roadmesh.models.pretrained import create_pretrained_model
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"[PREDICT] Using device: {device}")
+
+            # Check for fine-tuned weights
+            finetuned_path = Path("checkpoints/road_finetuned.pt")
+            checkpoint = str(finetuned_path) if finetuned_path.exists() else None
+
+            if checkpoint:
+                print(f"[PREDICT] Found fine-tuned weights: {finetuned_path}")
+            else:
+                print(f"[PREDICT] Using ImageNet pretrained encoder (not fine-tuned for roads)")
+                print(f"[PREDICT] For better results, train on DeepGlobe/SpaceNet dataset")
+
+            model = create_pretrained_model(
+                architecture="linknet",
+                encoder="resnet34",
+                checkpoint_path=checkpoint,
+                device=device
+            )
+            model.eval()
+
+            # Preprocess image
+            img_resized = cv2.resize(image, (512, 512))
+            img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
+            img_tensor = img_tensor.unsqueeze(0).to(device=device, dtype=torch.float32)
+
+            # Use model's preprocessing
+            preprocess_fn = model.get_preprocessing_fn()
+            img_tensor = preprocess_fn(img_tensor)
+
+            with torch.no_grad():
+                output = model(img_tensor.float())
+                pred = torch.sigmoid(output).squeeze().cpu().numpy()
+                mask = (pred > 0.3).astype(np.uint8)  # Lower threshold for pretrained
+
+            print(f"[PREDICT] Pretrained model inference complete")
+
         else:
-            # ML-based detection
-            await update(40, "Loading ML model...")
+            # ML-based detection with custom trained model
+            await update(40, "Loading custom trained model...")
             from roadmesh.models.architectures import create_model
 
             model_path = Path("checkpoints/best_model.pt")
@@ -613,7 +655,7 @@ async def run_inference(job_id: str, request: PredictRequest):
                 model_path = Path(f"checkpoints/{request.model_name}.pt")
 
             if not model_path.exists():
-                await update(0, "No trained model found. Use color mode or train first!", "failed")
+                await update(0, "No trained model found. Use color or pretrained mode!", "failed")
                 return
 
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -855,7 +897,8 @@ async def index():
         <label style="font-size:12px;color:#888;">Detection Mode:</label>
         <select id="detection-mode" class="btn" style="background:#2d2d44;color:white;text-align:left;margin:5px 0;">
             <option value="color">🎨 Color-based (fast, no training)</option>
-            <option value="ml">🧠 ML Model (requires training)</option>
+            <option value="pretrained">🚀 Pretrained (ImageNet encoder)</option>
+            <option value="ml">🧠 Custom ML (requires training)</option>
         </select>
         <label style="display:flex;align-items:center;margin:5px 0;">
             <input type="checkbox" id="bind-graph" checked style="margin-right:8px;">
