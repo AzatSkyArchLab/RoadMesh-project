@@ -41,13 +41,13 @@ class Trainer:
         self.config = config
         self.device = device
         self.experiment_name = experiment_name or f"exp_{int(time.time())}"
-        
-        # Loss function
+
+        # Loss function (must be on same device as model!)
         self.criterion = CombinedLoss(
             bce_weight=config.bce_weight,
             dice_weight=config.dice_weight,
             connectivity_weight=config.connectivity_weight,
-        )
+        ).to(device)  # Move loss to device for ConnectivityLoss buffers
         
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -63,6 +63,8 @@ class Trainer:
         self.scaler = GradScaler() if config.mixed_precision else None
         
         # Checkpoint directory
+        self.root_checkpoint_dir = config.checkpoint_dir  # For best_model.pt
+        self.root_checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_dir = config.checkpoint_dir / self.experiment_name
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
@@ -116,16 +118,20 @@ class Trainer:
         pbar = tqdm(dataloader, desc=f"Epoch {self.current_epoch}")
         
         for batch_idx, (images, masks) in enumerate(pbar):
-            images = images.to(self.device)
-            masks = masks.to(self.device)
-            
+            images = images.to(self.device, dtype=torch.float32)
+            masks = masks.to(self.device, dtype=torch.float32)
+
             # Mixed precision forward pass
             if self.config.mixed_precision:
-                with autocast():
+                with autocast(dtype=torch.float16):
                     outputs = self.model(images)
-                    losses = self.criterion(outputs, masks)
+                    # Compute loss outside autocast to avoid FP16 issues with buffers
+                with autocast(enabled=False):
+                    outputs_fp32 = outputs.float()
+                    masks_fp32 = masks.float()
+                    losses = self.criterion(outputs_fp32, masks_fp32)
                     loss = losses['total'] / accumulation_steps
-                
+
                 # Scaled backward pass
                 self.scaler.scale(loss).backward()
             else:
@@ -174,16 +180,18 @@ class Trainer:
         total_recall = 0.0
         
         for images, masks in tqdm(dataloader, desc="Validating"):
-            images = images.to(self.device)
-            masks = masks.to(self.device)
-            
+            images = images.to(self.device, dtype=torch.float32)
+            masks = masks.to(self.device, dtype=torch.float32)
+
             if self.config.mixed_precision:
-                with autocast():
+                with autocast(dtype=torch.float16):
                     outputs = self.model(images)
+                # Compute loss outside autocast
+                outputs = outputs.float()
             else:
                 outputs = self.model(images)
-            
-            losses = self.criterion(outputs, masks)
+
+            losses = self.criterion(outputs.float(), masks.float())
             total_loss += losses['total'].item()
             
             # Compute IoU
@@ -249,10 +257,13 @@ class Trainer:
         
         path = self.checkpoint_dir / filename
         torch.save(checkpoint, path)
-        
+
         if is_best:
-            best_path = self.checkpoint_dir / "best_model.pt"
+            # Save best_model.pt to ROOT checkpoint dir (not experiment subdir)
+            # so that prediction can find it at checkpoints/best_model.pt
+            best_path = self.root_checkpoint_dir / "best_model.pt"
             torch.save(checkpoint, best_path)
+            print(f"Saved best model to {best_path}")
     
     def load_checkpoint(self, path: Path):
         """Load training checkpoint."""

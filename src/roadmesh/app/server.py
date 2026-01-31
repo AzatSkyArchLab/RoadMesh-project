@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional
 from datetime import datetime
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, UploadFile, File
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import torch
@@ -25,12 +25,196 @@ from shapely.geometry import box
 app = FastAPI(title="RoadMesh", version="0.1.0")
 
 
+def detect_roads_by_color(image: np.ndarray) -> np.ndarray:
+    """
+    Advanced road detection using color, texture, and line detection.
+    Combines multiple techniques for robust road extraction.
+    """
+    h, w = image.shape[:2]
+
+    # Convert to different color spaces
+    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+
+    # === 1. Color-based detection ===
+    # Dark asphalt roads (most common)
+    lower_dark = np.array([0, 0, 30])
+    upper_dark = np.array([180, 70, 130])
+    mask_dark = cv2.inRange(hsv, lower_dark, upper_dark)
+
+    # Medium gray roads (concrete)
+    lower_gray = np.array([0, 0, 100])
+    upper_gray = np.array([180, 50, 170])
+    mask_gray = cv2.inRange(hsv, lower_gray, upper_gray)
+
+    # Use LAB for better gray detection (a and b channels near 128)
+    l_channel = lab[:, :, 0]
+    a_channel = lab[:, :, 1]
+    b_channel = lab[:, :, 2]
+
+    # Roads have low saturation in LAB (a and b near neutral)
+    neutral_mask = (np.abs(a_channel.astype(np.float32) - 128) < 15) & \
+                   (np.abs(b_channel.astype(np.float32) - 128) < 15) & \
+                   (l_channel > 40) & (l_channel < 180)
+    neutral_mask = (neutral_mask * 255).astype(np.uint8)
+
+    # Combine color masks
+    color_mask = cv2.bitwise_or(mask_dark, mask_gray)
+    color_mask = cv2.bitwise_and(color_mask, neutral_mask)
+
+    # === 2. Edge and texture analysis ===
+    # Roads have smooth texture (low variance locally)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Local variance as texture measure
+    mean_local = cv2.blur(gray.astype(np.float32), (15, 15))
+    mean_sq_local = cv2.blur((gray.astype(np.float32) ** 2), (15, 15))
+    variance = mean_sq_local - mean_local ** 2
+    variance = np.clip(variance, 0, None)
+
+    # Low variance = smooth = potential road
+    smooth_mask = (variance < 400).astype(np.uint8) * 255
+
+    # Combine with color
+    combined = cv2.bitwise_and(color_mask, smooth_mask)
+
+    # === 3. Line detection using Hough transform ===
+    edges = cv2.Canny(blurred, 30, 100)
+
+    # Probabilistic Hough transform to find line segments
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=50,
+                            minLineLength=30, maxLineGap=20)
+
+    line_mask = np.zeros((h, w), dtype=np.uint8)
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            # Draw thick lines to represent road width
+            cv2.line(line_mask, (x1, y1), (x2, y2), 255, thickness=8)
+
+    # Dilate line mask to cover road width
+    line_mask = cv2.dilate(line_mask, np.ones((5, 5), np.uint8), iterations=2)
+
+    # === 4. Morphological filtering for linear features ===
+    # Multi-angle line detection
+    angles = [0, 45, 90, 135]
+    linear_masks = []
+
+    for angle in angles:
+        length = 15
+        kernel = np.zeros((length, length), dtype=np.uint8)
+        center = length // 2
+
+        if angle == 0:
+            kernel[center, :] = 1
+        elif angle == 90:
+            kernel[:, center] = 1
+        elif angle == 45:
+            for i in range(length):
+                kernel[i, i] = 1
+        else:  # 135
+            for i in range(length):
+                kernel[i, length - 1 - i] = 1
+
+        opened = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel)
+        linear_masks.append(opened)
+
+    linear_combined = np.zeros_like(combined)
+    for lm in linear_masks:
+        linear_combined = cv2.bitwise_or(linear_combined, lm)
+
+    # === 5. Combine all evidence ===
+    # Weighted combination
+    result = np.zeros_like(gray, dtype=np.float32)
+    result += linear_combined.astype(np.float32) * 0.5
+    result += line_mask.astype(np.float32) * 0.3
+    result += color_mask.astype(np.float32) * 0.2
+
+    # Normalize
+    result = np.clip(result, 0, 255).astype(np.uint8)
+    _, result = cv2.threshold(result, 80, 255, cv2.THRESH_BINARY)
+
+    # === 6. Shape filtering ===
+    # Close gaps
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    result = cv2.morphologyEx(result, cv2.MORPH_CLOSE, kernel_close)
+
+    # Find and filter contours
+    contours, _ = cv2.findContours(result, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    final_mask = np.zeros_like(result)
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < 200:  # Skip tiny regions
+            continue
+
+        # Get minimum area rect
+        rect = cv2.minAreaRect(contour)
+        rect_w, rect_h = rect[1]
+        if rect_w > 0 and rect_h > 0:
+            elongation = max(rect_w, rect_h) / (min(rect_w, rect_h) + 1)
+        else:
+            elongation = 1
+
+        # Calculate perimeter-to-area ratio (roads are elongated)
+        perimeter = cv2.arcLength(contour, True)
+        compactness = (perimeter ** 2) / (4 * np.pi * area + 1)
+
+        # Convex hull analysis
+        hull = cv2.convexHull(contour)
+        hull_area = cv2.contourArea(hull)
+        solidity = area / (hull_area + 1)
+
+        # Road criteria:
+        # - Elongated (elongation > 1.8) OR
+        # - Large area (> 2000) with low compactness
+        # - Not too "blobby" (solidity check)
+        is_road = False
+
+        if elongation > 1.8 and solidity > 0.3:
+            is_road = True
+        elif area > 3000 and compactness > 3 and solidity > 0.4:
+            is_road = True
+        elif area > 1000 and elongation > 2.5:
+            is_road = True
+
+        if is_road:
+            cv2.drawContours(final_mask, [contour], -1, 255, -1)
+
+    # Final morphological cleanup
+    kernel_final = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_OPEN, kernel_final)
+    final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, kernel_final)
+
+    return final_mask
+
+
+# Available GeoJSON sources
+GEOJSON_SOURCES = {
+    "osi_sush": {
+        "name": "ОСИ Москвы (официальная)",
+        "path": "data/geojson_data/osi_sush.geojson",
+        "road_type_field": "kl_gp",
+        "description": "Официальная дорожная сеть Москвы"
+    },
+    "osm": {
+        "name": "OpenStreetMap",
+        "path": "data/geojson_data/osm_roads.geojson",
+        "road_type_field": "highway",
+        "description": "Дороги из OpenStreetMap"
+    },
+}
+
+
 # Global state
 class AppState:
     def __init__(self):
         self.active_connections: list[WebSocket] = []
         self.jobs: dict[str, dict] = {}
         self.models: dict[str, Path] = {}
+        self.current_source: str = "osi_sush"  # Default source
+        self.custom_geojson: dict = None  # Custom uploaded GeoJSON
 
 state = AppState()
 
@@ -52,6 +236,9 @@ class TrainRequest(BaseModel):
 class PredictRequest(BaseModel):
     bbox: BBox
     model_name: Optional[str] = None
+    bind_to_graph: bool = True  # Привязывать детекции к дорожному графу
+    source: Optional[str] = None  # Источник данных для привязки
+    detection_mode: str = "color"  # "color" (fast, no ML) or "ml" (requires trained model)
 
 
 # WebSocket for progress updates
@@ -134,24 +321,188 @@ async def list_models():
     return {"models": models}
 
 
+@app.delete("/api/models/{model_name}")
+async def delete_model(model_name: str):
+    """Delete a trained model."""
+    models_dir = Path("checkpoints")
+    model_path = models_dir / f"{model_name}.pt"
+
+    if not model_path.exists():
+        return {"error": f"Model not found: {model_name}"}
+
+    try:
+        model_path.unlink()
+        return {"status": "ok", "message": f"Deleted {model_name}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.delete("/api/models")
+async def delete_all_models():
+    """Delete all trained models."""
+    models_dir = Path("checkpoints")
+    deleted = []
+
+    if models_dir.exists():
+        for f in models_dir.glob("*.pt"):
+            try:
+                f.unlink()
+                deleted.append(f.stem)
+            except Exception as e:
+                print(f"Failed to delete {f}: {e}")
+
+    return {"status": "ok", "deleted": deleted, "count": len(deleted)}
+
+
+@app.post("/api/models/{model_name}/activate")
+async def activate_model(model_name: str):
+    """Set a model as the active (best) model for inference."""
+    models_dir = Path("checkpoints")
+    source_path = models_dir / f"{model_name}.pt"
+    best_path = models_dir / "best_model.pt"
+
+    if not source_path.exists():
+        return {"error": f"Model not found: {model_name}"}
+
+    if model_name == "best_model":
+        return {"status": "ok", "message": "Already the active model"}
+
+    try:
+        import shutil
+        # Backup current best if exists
+        if best_path.exists():
+            backup_name = f"best_model_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
+            shutil.copy(best_path, models_dir / backup_name)
+
+        # Copy selected model to best_model
+        shutil.copy(source_path, best_path)
+        return {"status": "ok", "message": f"Activated {model_name} as best_model"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/sources")
+async def list_sources():
+    """List available GeoJSON data sources."""
+    sources = []
+    for key, info in GEOJSON_SOURCES.items():
+        path = Path(info["path"])
+        sources.append({
+            "id": key,
+            "name": info["name"],
+            "description": info["description"],
+            "exists": path.exists(),
+            "road_type_field": info["road_type_field"],
+        })
+
+    # Add custom source if uploaded
+    if state.custom_geojson:
+        sources.append({
+            "id": "custom",
+            "name": "Пользовательский GeoJSON",
+            "description": f"{len(state.custom_geojson.get('features', []))} объектов",
+            "exists": True,
+            "road_type_field": "auto",
+        })
+
+    return {
+        "sources": sources,
+        "current": state.current_source,
+    }
+
+
+@app.post("/api/sources/{source_id}")
+async def set_source(source_id: str):
+    """Set active GeoJSON source."""
+    if source_id not in GEOJSON_SOURCES and source_id != "custom":
+        return {"error": f"Unknown source: {source_id}"}
+
+    if source_id == "custom" and not state.custom_geojson:
+        return {"error": "No custom GeoJSON uploaded"}
+
+    state.current_source = source_id
+    return {"status": "ok", "current": source_id}
+
+
+@app.post("/api/sources/upload")
+async def upload_geojson(file: UploadFile = File(...)):
+    """Upload custom GeoJSON file."""
+    try:
+        content = await file.read()
+        geojson = json.loads(content.decode('utf-8'))
+
+        if geojson.get("type") != "FeatureCollection":
+            return {"error": "Invalid GeoJSON: must be FeatureCollection"}
+
+        features = geojson.get("features", [])
+        if not features:
+            return {"error": "GeoJSON has no features"}
+
+        # Detect properties
+        props = features[0].get("properties", {})
+        geom_type = features[0].get("geometry", {}).get("type", "Unknown")
+
+        state.custom_geojson = geojson
+        state.current_source = "custom"
+
+        # Save to file for persistence
+        custom_path = Path("data/geojson_data/custom_upload.geojson")
+        custom_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(custom_path, "w") as f:
+            json.dump(geojson, f)
+
+        return {
+            "status": "ok",
+            "features_count": len(features),
+            "geometry_type": geom_type,
+            "properties": list(props.keys())[:15],
+            "sample_properties": props,
+        }
+    except json.JSONDecodeError as e:
+        return {"error": f"Invalid JSON: {str(e)}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/ground-truth")
-async def get_ground_truth(minx: float, miny: float, maxx: float, maxy: float):
-    """Get ground truth roads for bbox."""
-    vector_path = Path("data/geojson_data/osi_sush.geojson")
-    
-    if not vector_path.exists():
-        return {"type": "FeatureCollection", "features": []}
-    
-    bbox = (minx, miny, maxx, maxy)
-    gdf = gpd.read_file(vector_path, bbox=bbox)
-    
+async def get_ground_truth(
+    minx: float,
+    miny: float,
+    maxx: float,
+    maxy: float,
+    source: Optional[str] = None
+):
+    """Get ground truth roads for bbox from selected source."""
+    # Use specified source or current default
+    source_id = source or state.current_source
+
+    # Get GeoJSON data
+    if source_id == "custom":
+        if not state.custom_geojson:
+            return {"type": "FeatureCollection", "features": [], "source": "custom"}
+        # Filter custom GeoJSON by bbox
+        gdf = gpd.GeoDataFrame.from_features(state.custom_geojson["features"])
+        if gdf.crs is None:
+            gdf.set_crs("EPSG:4326", inplace=True)
+    elif source_id in GEOJSON_SOURCES:
+        vector_path = Path(GEOJSON_SOURCES[source_id]["path"])
+        if not vector_path.exists():
+            return {"type": "FeatureCollection", "features": [], "source": source_id}
+        gdf = gpd.read_file(vector_path, bbox=(minx, miny, maxx, maxy))
+    else:
+        return {"type": "FeatureCollection", "features": [], "error": "Unknown source"}
+
     if gdf.empty:
-        return {"type": "FeatureCollection", "features": []}
-    
-    bbox_geom = box(*bbox)
+        return {"type": "FeatureCollection", "features": [], "source": source_id}
+
+    bbox_geom = box(minx, miny, maxx, maxy)
     gdf = gdf[gdf.intersects(bbox_geom)]
-    
-    return json.loads(gdf.to_json())
+
+    result = json.loads(gdf.to_json())
+    result["source"] = source_id
+    result["source_name"] = GEOJSON_SOURCES.get(source_id, {}).get("name", "Custom")
+
+    return result
 
 
 @app.get("/api/predictions/{job_id}")
@@ -288,15 +639,16 @@ async def run_training(job_id: str, request: TrainRequest):
 
 
 async def run_inference(job_id: str, request: PredictRequest):
-    """Run inference on area."""
+    """Run inference on area with optional graph binding."""
     print(f"\n{'='*60}")
     print(f"[PREDICT] Starting job {job_id}")
     print(f"[PREDICT] BBox: {request.bbox}")
+    print(f"[PREDICT] Bind to graph: {request.bind_to_graph}")
     print(f"{'='*60}\n")
-    
+
     try:
         bbox = request.bbox
-        
+
         async def update(progress: float, message: str, status: str = "running"):
             print(f"[PREDICT] {progress:.0f}% - {message}")
             state.jobs[job_id].update({
@@ -306,95 +658,225 @@ async def run_inference(job_id: str, request: PredictRequest):
             })
             await broadcast({"type": "progress", "job_id": job_id, **state.jobs[job_id]})
             await asyncio.sleep(0.1)
-        
-        await update(0, "Loading model...")
-        
+
+        detection_mode = request.detection_mode or "color"
+        print(f"[PREDICT] Detection mode: {detection_mode}")
+
         from roadmesh.core.config import BBox as BBoxConfig
         from roadmesh.data.tile_fetcher import TileFetcher
-        from roadmesh.models.architectures import create_model
-        from roadmesh.geometry.vectorizer import Vectorizer
-        
-        model_path = Path("checkpoints/best_model.pt")
-        if request.model_name:
-            model_path = Path(f"checkpoints/{request.model_name}.pt")
-        
-        if not model_path.exists():
-            await update(0, "No trained model found. Train first!", "failed")
-            return
-        
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"[PREDICT] Using device: {device}")
-        print(f"[PREDICT] Loading model from: {model_path}")
-        
-        model = create_model("dlinknet34", checkpoint_path=str(model_path), device=device)
-        model.eval()
-        
-        await update(10, "Fetching satellite tiles...")
-        
+        from roadmesh.geometry.vectorizer import Vectorizer, GraphBinder, MeshBuilder
+
+        await update(5, "Fetching satellite tiles...")
+
         bbox_config = BBoxConfig(minx=bbox.minx, miny=bbox.miny, maxx=bbox.maxx, maxy=bbox.maxy)
-        fetcher = TileFetcher(provider="esri", cache_dir=Path("data/cache/tiles"))
-        
+        fetcher = TileFetcher(provider="google", cache_dir=Path("data/cache/tiles"))
+
         image, metadata = await fetcher.fetch_bbox_async(bbox_config, zoom=18)
         print(f"[PREDICT] Fetched image: {image.shape}")
-        
-        await update(40, "Running inference...")
-        
-        img_resized = cv2.resize(image, (512, 512))
-        img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
-        
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(device)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(device)
-        img_tensor = (img_tensor - mean) / std
-        img_tensor = img_tensor.unsqueeze(0).to(device)
-        
-        with torch.no_grad():
-            if device == "cuda":
-                with torch.cuda.amp.autocast():
-                    output = model(img_tensor)
+
+        await update(30, "Detecting roads...")
+
+        if detection_mode == "color":
+            # Color-based road detection (fast, no ML required)
+            await update(40, "Running color-based detection...")
+            mask = detect_roads_by_color(image)
+            # Resize mask to standard size
+            mask = cv2.resize(mask, (512, 512))
+            mask = (mask > 127).astype(np.uint8)
+            pred = mask.astype(np.float32)
+            print(f"[PREDICT] Color detection complete")
+
+        elif detection_mode == "pretrained":
+            # Use pretrained segmentation_models_pytorch with ImageNet encoder
+            await update(40, "Loading pretrained model (ImageNet encoder)...")
+            from roadmesh.models.pretrained import create_pretrained_model
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"[PREDICT] Using device: {device}")
+
+            # Check for fine-tuned weights
+            finetuned_path = Path("checkpoints/road_finetuned.pt")
+            checkpoint = str(finetuned_path) if finetuned_path.exists() else None
+
+            if checkpoint:
+                print(f"[PREDICT] Found fine-tuned weights: {finetuned_path}")
             else:
-                output = model(img_tensor)
-            
-            pred = torch.sigmoid(output).squeeze().cpu().numpy()
-            mask = (pred > 0.5).astype(np.uint8)
-        
+                print(f"[PREDICT] Using ImageNet pretrained encoder (not fine-tuned for roads)")
+                print(f"[PREDICT] For better results, train on DeepGlobe/SpaceNet dataset")
+
+            model = create_pretrained_model(
+                architecture="linknet",
+                encoder="resnet34",
+                checkpoint_path=checkpoint,
+                device=device
+            )
+            model.eval()
+
+            # Preprocess image
+            img_resized = cv2.resize(image, (512, 512))
+            img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
+            img_tensor = img_tensor.unsqueeze(0).to(device=device, dtype=torch.float32)
+
+            # Use model's preprocessing
+            preprocess_fn = model.get_preprocessing_fn()
+            img_tensor = preprocess_fn(img_tensor)
+
+            with torch.no_grad():
+                output = model(img_tensor.float())
+                pred = torch.sigmoid(output).squeeze().cpu().numpy()
+                mask = (pred > 0.3).astype(np.uint8)  # Lower threshold for pretrained
+
+            print(f"[PREDICT] Pretrained model inference complete")
+
+        else:
+            # ML-based detection with custom trained model
+            await update(40, "Loading custom trained model...")
+            from roadmesh.models.architectures import create_model
+
+            model_path = Path("checkpoints/best_model.pt")
+            if request.model_name:
+                model_path = Path(f"checkpoints/{request.model_name}.pt")
+
+            if not model_path.exists():
+                await update(0, "No trained model found. Use color or pretrained mode!", "failed")
+                return
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"[PREDICT] Using device: {device}")
+            print(f"[PREDICT] Loading model from: {model_path}")
+
+            model = create_model("dlinknet34", checkpoint_path=str(model_path), device=device)
+            model = model.float()
+            model.eval()
+
+            img_resized = cv2.resize(image, (512, 512))
+            img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
+            img_tensor = img_tensor.unsqueeze(0).to(device=device, dtype=torch.float32)
+
+            mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, device=device).view(1, 3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, device=device).view(1, 3, 1, 1)
+            img_tensor = (img_tensor - mean) / std
+
+            with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
+                output = model(img_tensor.float())
+                pred = torch.sigmoid(output).squeeze().cpu().numpy()
+                mask = (pred > 0.5).astype(np.uint8)
+
         print(f"[PREDICT] Mask shape: {mask.shape}, road pixels: {mask.sum()}")
-        
+
+        # Debug: save mask image
+        debug_dir = Path("data/debug")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(debug_dir / f"{job_id}_mask.png"), mask * 255)
+        cv2.imwrite(str(debug_dir / f"{job_id}_pred.png"), (pred * 255).astype(np.uint8))
+        print(f"[PREDICT] Debug masks saved to {debug_dir}")
+
         await update(70, "Vectorizing results...")
-        
-        vectorizer = Vectorizer()
+
+        # Use lower min_polygon_area for better detection
+        from roadmesh.core.config import GeometryConfig
+        geo_config = GeometryConfig(min_polygon_area=10.0, simplify_tolerance=1.0)
+        vectorizer = Vectorizer(config=geo_config)
         polygons_px = vectorizer.mask_to_polygons(mask * 255)
-        
+
         print(f"[PREDICT] Found {len(polygons_px)} polygons")
-        
+
+        properties_list = None
+        graph_info = None
+
         if polygons_px:
             polygons_geo = vectorizer.polygons_to_geo(
                 polygons_px,
                 bbox_config,
                 (mask.shape[1], mask.shape[0])
             )
-            geojson = vectorizer.to_geojson(polygons_geo)
+
+            # Bind to road graph if requested
+            if request.bind_to_graph and polygons_geo:
+                await update(80, "Binding to road graph...")
+
+                source_id = request.source or state.current_source
+                graph_gdf = None
+
+                # Load graph from selected source
+                if source_id == "custom" and state.custom_geojson:
+                    graph_gdf = gpd.GeoDataFrame.from_features(
+                        state.custom_geojson["features"]
+                    )
+                    if graph_gdf.crs is None:
+                        graph_gdf.set_crs("EPSG:4326", inplace=True)
+                elif source_id in GEOJSON_SOURCES:
+                    graph_path = Path(GEOJSON_SOURCES[source_id]["path"])
+                    if graph_path.exists():
+                        graph_gdf = gpd.read_file(
+                            graph_path,
+                            bbox=(bbox.minx, bbox.miny, bbox.maxx, bbox.maxy)
+                        )
+
+                if graph_gdf is not None and not graph_gdf.empty:
+                    print(f"[PREDICT] Binding to {len(graph_gdf)} graph edges")
+                    binder = GraphBinder(graph=graph_gdf, snap_tolerance=10.0)
+                    properties_list = binder.bind_polygons(polygons_geo)
+
+                    # Count bound polygons
+                    bound_count = sum(1 for p in properties_list if p.get("bound"))
+                    graph_info = {
+                        "source": source_id,
+                        "source_name": GEOJSON_SOURCES.get(source_id, {}).get("name", "Custom"),
+                        "edges_in_bbox": len(graph_gdf),
+                        "bound_polygons": bound_count,
+                        "unbound_polygons": len(polygons_geo) - bound_count,
+                    }
+                    print(f"[PREDICT] Bound {bound_count}/{len(polygons_geo)} polygons")
+
+            geojson = vectorizer.to_geojson(polygons_geo, properties_list)
+
+            # Build mesh for Three.js visualization
+            await update(85, "Building mesh...")
+            mesh_builder = MeshBuilder(default_elevation=0.5)
+            mesh = mesh_builder.polygons_to_mesh_collection(
+                polygons_geo,
+                properties_list,
+                elevation=0.5
+            )
         else:
             geojson = {"type": "FeatureCollection", "features": []}
-        
+            mesh = {"type": "MeshCollection", "features": [], "count": 0}
+
         await update(90, "Saving results...")
-        
+
         pred_dir = Path("data/predictions")
         pred_dir.mkdir(parents=True, exist_ok=True)
-        
+
+        # Save GeoJSON
         with open(pred_dir / f"{job_id}.geojson", "w") as f:
             json.dump(geojson, f)
-        
-        state.jobs[job_id]["result"] = {
+
+        # Save Mesh
+        with open(pred_dir / f"{job_id}_mesh.json", "w") as f:
+            json.dump(mesh, f)
+
+        result = {
             "geojson": geojson,
-            "polygon_count": len(geojson["features"])
+            "mesh": mesh,
+            "polygon_count": len(geojson["features"]),
         }
-        
-        await update(100, f"Done! Found {len(geojson['features'])} road polygons", "completed")
-        
+
+        if graph_info:
+            result["graph_binding"] = graph_info
+
+        state.jobs[job_id]["result"] = result
+
+        msg = f"Done! Found {len(geojson['features'])} road polygons"
+        if graph_info:
+            msg += f" ({graph_info['bound_polygons']} bound to {graph_info['source_name']})"
+
+        await update(100, msg, "completed")
+
         await fetcher.close()
-        
-        print(f"[PREDICT] Completed! Found {len(geojson['features'])} polygons")
-        
+
+        print(f"[PREDICT] Completed! {msg}")
+
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -471,11 +953,40 @@ async def index():
         <h3>1. SELECT AREA</h3>
         <button class="btn btn-primary" id="btn-draw">📍 Draw Rectangle</button>
         <button class="btn btn-danger" id="btn-clear" style="display:none">✕ Clear Selection</button>
-        <h3>2. TRAIN MODEL</h3>
+        <h3>2. DATA SOURCE</h3>
+        <select id="source-select" class="btn" style="background:#2d2d44;color:white;text-align:left;">
+            <option value="osi_sush">ОСИ Москвы (официальная)</option>
+            <option value="osm">OpenStreetMap</option>
+            <option value="custom" disabled>Свой GeoJSON (загрузите)</option>
+        </select>
+        <input type="file" id="geojson-upload" accept=".geojson,.json" style="display:none">
+        <button class="btn" style="background:#444" id="btn-upload">📁 Загрузить свой GeoJSON</button>
+        <div id="upload-info" style="display:none;font-size:11px;color:#888;margin:5px 0;"></div>
+        <h3>3. TRAIN MODEL</h3>
         <label>Epochs:</label>
         <input type="number" id="epochs" value="10" min="1" max="200">
         <button class="btn btn-primary" id="btn-train" disabled>🧠 Train Model</button>
-        <h3>3. DETECT ROADS</h3>
+
+        <h3>📦 MODELS</h3>
+        <div id="models-list" style="background:#2d2d44;border-radius:6px;padding:10px;margin:10px 0;max-height:150px;overflow-y:auto;font-size:12px;">
+            Loading...
+        </div>
+        <div style="display:flex;gap:5px;">
+            <button class="btn" style="background:#444;flex:1;padding:8px;" id="btn-refresh-models">🔄 Refresh</button>
+            <button class="btn btn-danger" style="flex:1;padding:8px;" id="btn-delete-all">🗑️ Delete All</button>
+        </div>
+
+        <h3>4. DETECT ROADS</h3>
+        <label style="font-size:12px;color:#888;">Detection Mode:</label>
+        <select id="detection-mode" class="btn" style="background:#2d2d44;color:white;text-align:left;margin:5px 0;">
+            <option value="color">🎨 Color-based (fast, no training)</option>
+            <option value="pretrained">🚀 Pretrained (ImageNet encoder)</option>
+            <option value="ml">🧠 Custom ML (requires training)</option>
+        </select>
+        <label style="display:flex;align-items:center;margin:5px 0;">
+            <input type="checkbox" id="bind-graph" checked style="margin-right:8px;">
+            Привязать к дорожному графу
+        </label>
         <button class="btn btn-success" id="btn-predict" disabled>🔍 Detect Roads</button>
         <div class="progress-container" id="progress">
             <div class="progress-text" id="progress-message">Processing...</div>
@@ -484,8 +995,9 @@ async def index():
         </div>
         <div class="legend">
             <strong>Legend</strong>
-            <div class="legend-item"><div class="legend-color" style="background:#00ff00"></div>Ground Truth</div>
-            <div class="legend-item"><div class="legend-color" style="background:#ff0000"></div>Predictions</div>
+            <div class="legend-item"><div class="legend-color" style="background:#00ff00"></div>Ground Truth (source)</div>
+            <div class="legend-item"><div class="legend-color" style="background:#ff6600"></div>Detected (bound)</div>
+            <div class="legend-item"><div class="legend-color" style="background:#ff0000"></div>Detected (unbound)</div>
             <div class="legend-item"><div class="legend-color" style="background:#00d4ff"></div>Selected Area</div>
         </div>
     </div>
@@ -493,9 +1005,30 @@ async def index():
     <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
     <script>
         const map = L.map('map').setView([55.751244, 37.618423], 14);
-        const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {attribution: 'Esri', maxZoom: 19}).addTo(map);
-        const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {attribution: 'OSM', maxZoom: 19});
-        L.control.layers({"Satellite": satellite, "OpenStreetMap": osm}).addTo(map);
+
+        // Multiple satellite tile sources (use working ones)
+        const googleSat = L.tileLayer('https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
+            attribution: 'Google Satellite', maxZoom: 20
+        });
+        const esriSat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+            attribution: 'Esri', maxZoom: 19
+        });
+        const yandexSat = L.tileLayer('https://sat0{s}.maps.yandex.net/tiles?l=sat&x={x}&y={y}&z={z}', {
+            attribution: 'Yandex', maxZoom: 19, subdomains: '1234'
+        });
+        const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: 'OSM', maxZoom: 19
+        });
+
+        // Use Google Satellite by default (more reliable)
+        googleSat.addTo(map);
+
+        L.control.layers({
+            "Google Satellite": googleSat,
+            "Esri Satellite": esriSat,
+            "Yandex Satellite": yandexSat,
+            "OpenStreetMap": osm
+        }).addTo(map);
 
         const drawnItems = new L.FeatureGroup().addTo(map);
         const drawControl = new L.Control.Draw({
@@ -579,17 +1112,49 @@ async def index():
 
         async function loadGroundTruth() {
             if (!currentBbox) return;
-            const url = '/api/ground-truth?minx=' + currentBbox.minx + '&miny=' + currentBbox.miny + '&maxx=' + currentBbox.maxx + '&maxy=' + currentBbox.maxy;
+            const source = document.getElementById('source-select').value;
+            const url = '/api/ground-truth?minx=' + currentBbox.minx + '&miny=' + currentBbox.miny + '&maxx=' + currentBbox.maxx + '&maxy=' + currentBbox.maxy + '&source=' + source;
             const resp = await fetch(url);
             const geojson = await resp.json();
             if (gtLayer) map.removeLayer(gtLayer);
             gtLayer = L.geoJSON(geojson, {style: {color: '#00ff00', weight: 3, opacity: 0.8}}).addTo(map);
-            setStatus('Loaded ' + geojson.features.length + ' road segments', 'success');
+            const sourceName = geojson.source_name || source;
+            setStatus('Loaded ' + geojson.features.length + ' road segments from ' + sourceName, 'success');
         }
 
         function showPredictions(geojson) {
             if (predLayer) map.removeLayer(predLayer);
-            predLayer = L.geoJSON(geojson, {style: {color: '#ff0000', weight: 2, opacity: 0.9, fillColor: '#ff0000', fillOpacity: 0.4}}).addTo(map);
+            predLayer = L.geoJSON(geojson, {
+                style: function(feature) {
+                    const bound = feature.properties && feature.properties.bound;
+                    return {
+                        color: bound ? '#ff6600' : '#ff0000',
+                        weight: 2,
+                        opacity: 0.9,
+                        fillColor: bound ? '#ff6600' : '#ff0000',
+                        fillOpacity: bound ? 0.5 : 0.3
+                    };
+                },
+                onEachFeature: function(feature, layer) {
+                    if (feature.properties) {
+                        let popup = '<b>Polygon #' + (feature.properties.id || '?') + '</b><br>';
+                        if (feature.properties.bound) {
+                            popup += '<span style="color:#0f0">✓ Bound to graph</span><br>';
+                            if (feature.properties.edge_id !== undefined) popup += 'Edge ID: ' + feature.properties.edge_id + '<br>';
+                            // Show road properties if available
+                            const skip = ['id', 'bound', 'edge_id'];
+                            for (const [k, v] of Object.entries(feature.properties)) {
+                                if (!skip.includes(k) && v !== null && v !== undefined) {
+                                    popup += k + ': ' + v + '<br>';
+                                }
+                            }
+                        } else {
+                            popup += '<span style="color:#f00">✗ Not bound</span>';
+                        }
+                        layer.bindPopup(popup);
+                    }
+                }
+            }).addTo(map);
         }
 
         btnTrain.onclick = async () => {
@@ -610,12 +1175,118 @@ async def index():
             progressContainer.style.display = 'block';
             progressFill.style.width = '0%';
             setStatus('Starting detection...', 'info');
+            const bindToGraph = document.getElementById('bind-graph').checked;
+            const source = document.getElementById('source-select').value;
+            const detectionMode = document.getElementById('detection-mode').value;
             await fetch('/api/predict', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({bbox: currentBbox})
+                body: JSON.stringify({
+                    bbox: currentBbox,
+                    bind_to_graph: bindToGraph,
+                    source: source,
+                    detection_mode: detectionMode
+                })
             });
         };
+
+        // Data source handling
+        const sourceSelect = document.getElementById('source-select');
+        const uploadInfo = document.getElementById('upload-info');
+        const fileInput = document.getElementById('geojson-upload');
+
+        document.getElementById('btn-upload').onclick = () => fileInput.click();
+
+        fileInput.onchange = async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            setStatus('Uploading GeoJSON...', 'info');
+            const formData = new FormData();
+            formData.append('file', file);
+            try {
+                const resp = await fetch('/api/sources/upload', {method: 'POST', body: formData});
+                const result = await resp.json();
+                if (result.error) {
+                    setStatus('Error: ' + result.error, 'error');
+                } else {
+                    setStatus('GeoJSON uploaded: ' + result.features_count + ' features', 'success');
+                    uploadInfo.innerHTML = '<b>File:</b> ' + file.name + '<br><b>Features:</b> ' + result.features_count + '<br><b>Properties:</b> ' + result.properties.slice(0,5).join(', ');
+                    uploadInfo.style.display = 'block';
+                    // Enable and select custom option
+                    sourceSelect.querySelector('option[value="custom"]').disabled = false;
+                    sourceSelect.value = 'custom';
+                    if (currentBbox) loadGroundTruth();
+                }
+            } catch(err) {
+                setStatus('Upload failed: ' + err, 'error');
+            }
+        };
+
+        sourceSelect.onchange = async () => {
+            await fetch('/api/sources/' + sourceSelect.value, {method: 'POST'});
+            if (currentBbox) {
+                setStatus('Loading roads from ' + sourceSelect.options[sourceSelect.selectedIndex].text + '...', 'info');
+                await loadGroundTruth();
+            }
+        };
+
+        // Model management
+        const modelsList = document.getElementById('models-list');
+
+        async function loadModels() {
+            try {
+                const resp = await fetch('/api/models');
+                const data = await resp.json();
+                if (data.models.length === 0) {
+                    modelsList.innerHTML = '<span style="color:#888">No models yet. Train one!</span>';
+                    return;
+                }
+                modelsList.innerHTML = data.models.map(m => {
+                    const date = new Date(m.created).toLocaleDateString('ru-RU', {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+                    const isBest = m.name === 'best_model';
+                    return '<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid #444">' +
+                        '<span>' + (isBest ? '⭐ ' : '') + m.name + '<br><small style="color:#666">' + date + ' | ' + m.size_mb.toFixed(1) + 'MB</small></span>' +
+                        '<div>' +
+                            (isBest ? '' : '<button onclick="activateModel(\\'' + m.name + '\\')" style="background:#00d4ff;border:none;color:#000;padding:3px 6px;border-radius:3px;cursor:pointer;margin-right:3px;font-size:10px">Use</button>') +
+                            '<button onclick="deleteModel(\\'' + m.name + '\\')" style="background:#ff4757;border:none;color:#fff;padding:3px 6px;border-radius:3px;cursor:pointer;font-size:10px">✕</button>' +
+                        '</div>' +
+                    '</div>';
+                }).join('');
+            } catch(err) {
+                modelsList.innerHTML = '<span style="color:#ff4757">Error loading models</span>';
+            }
+        }
+
+        async function deleteModel(name) {
+            if (!confirm('Delete model "' + name + '"?')) return;
+            await fetch('/api/models/' + name, {method: 'DELETE'});
+            loadModels();
+            setStatus('Model ' + name + ' deleted', 'info');
+        }
+
+        async function activateModel(name) {
+            const resp = await fetch('/api/models/' + name + '/activate', {method: 'POST'});
+            const result = await resp.json();
+            if (result.error) {
+                setStatus('Error: ' + result.error, 'error');
+            } else {
+                setStatus('Model ' + name + ' activated', 'success');
+                loadModels();
+            }
+        }
+
+        document.getElementById('btn-refresh-models').onclick = loadModels;
+
+        document.getElementById('btn-delete-all').onclick = async () => {
+            if (!confirm('Delete ALL models? This cannot be undone!')) return;
+            const resp = await fetch('/api/models', {method: 'DELETE'});
+            const result = await resp.json();
+            setStatus('Deleted ' + result.count + ' models', 'info');
+            loadModels();
+        };
+
+        // Load models on start
+        loadModels();
     </script>
 </body>
 </html>"""

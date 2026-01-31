@@ -93,7 +93,9 @@ data/test_output/
 *.onnx
 checkpoints/
 weights/
-models/
+/models/
+# But NOT the source code models:
+!src/roadmesh/models/
 
 # Logs
 logs/
