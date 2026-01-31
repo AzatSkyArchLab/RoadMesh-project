@@ -18,6 +18,7 @@ from roadmesh.models.pretrained import (
     create_pretrained_model,
     PretrainedRoadSegmentation,
     list_available_encoders,
+    find_pretrained_weights,
 )
 
 __all__ = [
@@ -31,4 +32,5 @@ __all__ = [
     "create_pretrained_model",
     "PretrainedRoadSegmentation",
     "list_available_encoders",
+    "find_pretrained_weights",
 ]

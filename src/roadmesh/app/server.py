@@ -27,84 +27,167 @@ app = FastAPI(title="RoadMesh", version="0.1.0")
 
 def detect_roads_by_color(image: np.ndarray) -> np.ndarray:
     """
-    Detect roads using color-based analysis with shape filtering.
-    Roads are typically dark gray asphalt and have elongated shapes.
+    Advanced road detection using color, texture, and line detection.
+    Combines multiple techniques for robust road extraction.
     """
-    # Convert to HSV for better color filtering
+    h, w = image.shape[:2]
+
+    # Convert to different color spaces
     hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-
-    # Also convert to grayscale for edge detection
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
 
-    # Strict filter for dark asphalt roads only
-    # Dark gray: low saturation, value 40-120 (darker tones)
-    lower_dark = np.array([0, 0, 40])
-    upper_dark = np.array([180, 60, 120])
+    # === 1. Color-based detection ===
+    # Dark asphalt roads (most common)
+    lower_dark = np.array([0, 0, 30])
+    upper_dark = np.array([180, 70, 130])
     mask_dark = cv2.inRange(hsv, lower_dark, upper_dark)
 
-    # Medium gray roads
-    lower_med = np.array([0, 0, 80])
-    upper_med = np.array([180, 40, 140])
-    mask_med = cv2.inRange(hsv, lower_med, upper_med)
+    # Medium gray roads (concrete)
+    lower_gray = np.array([0, 0, 100])
+    upper_gray = np.array([180, 50, 170])
+    mask_gray = cv2.inRange(hsv, lower_gray, upper_gray)
 
-    # Combine
-    mask = cv2.bitwise_or(mask_dark, mask_med)
+    # Use LAB for better gray detection (a and b channels near 128)
+    l_channel = lab[:, :, 0]
+    a_channel = lab[:, :, 1]
+    b_channel = lab[:, :, 2]
 
-    # Use edge detection to find road boundaries
-    edges = cv2.Canny(gray, 50, 150)
-    edges_dilated = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+    # Roads have low saturation in LAB (a and b near neutral)
+    neutral_mask = (np.abs(a_channel.astype(np.float32) - 128) < 15) & \
+                   (np.abs(b_channel.astype(np.float32) - 128) < 15) & \
+                   (l_channel > 40) & (l_channel < 180)
+    neutral_mask = (neutral_mask * 255).astype(np.uint8)
 
-    # Roads often have parallel edges - use this to filter
-    # Apply morphological operations
-    kernel_line = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
-    kernel_line2 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 15))
+    # Combine color masks
+    color_mask = cv2.bitwise_or(mask_dark, mask_gray)
+    color_mask = cv2.bitwise_and(color_mask, neutral_mask)
 
-    # Detect horizontal and vertical linear features
-    horizontal = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_line)
-    vertical = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_line2)
-    linear_mask = cv2.bitwise_or(horizontal, vertical)
+    # === 2. Edge and texture analysis ===
+    # Roads have smooth texture (low variance locally)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # Close gaps in linear features
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    linear_mask = cv2.morphologyEx(linear_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    # Local variance as texture measure
+    mean_local = cv2.blur(gray.astype(np.float32), (15, 15))
+    mean_sq_local = cv2.blur((gray.astype(np.float32) ** 2), (15, 15))
+    variance = mean_sq_local - mean_local ** 2
+    variance = np.clip(variance, 0, None)
 
-    # Find contours and filter by shape
-    contours, _ = cv2.findContours(linear_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Low variance = smooth = potential road
+    smooth_mask = (variance < 400).astype(np.uint8) * 255
 
-    result_mask = np.zeros_like(mask)
+    # Combine with color
+    combined = cv2.bitwise_and(color_mask, smooth_mask)
+
+    # === 3. Line detection using Hough transform ===
+    edges = cv2.Canny(blurred, 30, 100)
+
+    # Probabilistic Hough transform to find line segments
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=50,
+                            minLineLength=30, maxLineGap=20)
+
+    line_mask = np.zeros((h, w), dtype=np.uint8)
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            # Draw thick lines to represent road width
+            cv2.line(line_mask, (x1, y1), (x2, y2), 255, thickness=8)
+
+    # Dilate line mask to cover road width
+    line_mask = cv2.dilate(line_mask, np.ones((5, 5), np.uint8), iterations=2)
+
+    # === 4. Morphological filtering for linear features ===
+    # Multi-angle line detection
+    angles = [0, 45, 90, 135]
+    linear_masks = []
+
+    for angle in angles:
+        length = 15
+        kernel = np.zeros((length, length), dtype=np.uint8)
+        center = length // 2
+
+        if angle == 0:
+            kernel[center, :] = 1
+        elif angle == 90:
+            kernel[:, center] = 1
+        elif angle == 45:
+            for i in range(length):
+                kernel[i, i] = 1
+        else:  # 135
+            for i in range(length):
+                kernel[i, length - 1 - i] = 1
+
+        opened = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel)
+        linear_masks.append(opened)
+
+    linear_combined = np.zeros_like(combined)
+    for lm in linear_masks:
+        linear_combined = cv2.bitwise_or(linear_combined, lm)
+
+    # === 5. Combine all evidence ===
+    # Weighted combination
+    result = np.zeros_like(gray, dtype=np.float32)
+    result += linear_combined.astype(np.float32) * 0.5
+    result += line_mask.astype(np.float32) * 0.3
+    result += color_mask.astype(np.float32) * 0.2
+
+    # Normalize
+    result = np.clip(result, 0, 255).astype(np.uint8)
+    _, result = cv2.threshold(result, 80, 255, cv2.THRESH_BINARY)
+
+    # === 6. Shape filtering ===
+    # Close gaps
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    result = cv2.morphologyEx(result, cv2.MORPH_CLOSE, kernel_close)
+
+    # Find and filter contours
+    contours, _ = cv2.findContours(result, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    final_mask = np.zeros_like(result)
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area < 300:  # Skip tiny regions
+        if area < 200:  # Skip tiny regions
             continue
 
-        # Get bounding rect for aspect ratio
-        x, y, w, h = cv2.boundingRect(contour)
-        aspect_ratio = max(w, h) / (min(w, h) + 1)
-
-        # Get minimum area rect for better elongation measure
+        # Get minimum area rect
         rect = cv2.minAreaRect(contour)
         rect_w, rect_h = rect[1]
         if rect_w > 0 and rect_h > 0:
-            elongation = max(rect_w, rect_h) / min(rect_w, rect_h)
+            elongation = max(rect_w, rect_h) / (min(rect_w, rect_h) + 1)
         else:
             elongation = 1
 
-        # Roads should be elongated (aspect ratio > 2) or large connected areas
-        # Reject square-ish shapes (buildings)
-        if elongation > 2.0 or area > 5000:
-            # Additional check: solidity (roads are usually solid, not hollow)
-            hull = cv2.convexHull(contour)
-            hull_area = cv2.contourArea(hull)
-            solidity = area / (hull_area + 1)
+        # Calculate perimeter-to-area ratio (roads are elongated)
+        perimeter = cv2.arcLength(contour, True)
+        compactness = (perimeter ** 2) / (4 * np.pi * area + 1)
 
-            if solidity > 0.4:  # Roads are fairly solid
-                cv2.drawContours(result_mask, [contour], -1, 255, -1)
+        # Convex hull analysis
+        hull = cv2.convexHull(contour)
+        hull_area = cv2.contourArea(hull)
+        solidity = area / (hull_area + 1)
 
-    # Final cleanup
-    kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    result_mask = cv2.morphologyEx(result_mask, cv2.MORPH_CLOSE, kernel_small)
+        # Road criteria:
+        # - Elongated (elongation > 1.8) OR
+        # - Large area (> 2000) with low compactness
+        # - Not too "blobby" (solidity check)
+        is_road = False
 
-    return result_mask
+        if elongation > 1.8 and solidity > 0.3:
+            is_road = True
+        elif area > 3000 and compactness > 3 and solidity > 0.4:
+            is_road = True
+        elif area > 1000 and elongation > 2.5:
+            is_road = True
+
+        if is_road:
+            cv2.drawContours(final_mask, [contour], -1, 255, -1)
+
+    # Final morphological cleanup
+    kernel_final = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_OPEN, kernel_final)
+    final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, kernel_final)
+
+    return final_mask
 
 
 # Available GeoJSON sources

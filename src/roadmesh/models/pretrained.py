@@ -6,6 +6,7 @@ Provides easy access to pretrained models for road extraction from satellite ima
 from __future__ import annotations
 
 import os
+import urllib.error
 from pathlib import Path
 from typing import Optional, Literal
 import urllib.request
@@ -47,6 +48,17 @@ PRETRAINED_URLS = {
     "dlinknet_deepglobe": "https://www.dropbox.com/sh/h62vr320eiy57tt/AAB5Tm43-efmtYzW_GFyUCfma?dl=1",
 }
 
+# Known checkpoint filenames to search for
+KNOWN_CHECKPOINT_NAMES = [
+    "dlinknet34_deepglobe.pt",
+    "dlinknet34_deepglobe.pth",
+    "dlinknet34_deepglobe.th",
+    "dlink34_road.pt",
+    "road_deepglobe_best.pt",
+    "best_model.pt",
+    "road_finetuned.pt",
+]
+
 
 class PretrainedRoadSegmentation(nn.Module):
     """
@@ -87,13 +99,25 @@ class PretrainedRoadSegmentation(nn.Module):
         if model_class is None:
             raise ValueError(f"Unknown architecture: {architecture}")
 
-        self.model = model_class(
-            encoder_name=encoder_name,
-            encoder_weights=encoder_weights,
-            in_channels=3,
-            classes=num_classes,
-            activation=None,  # We'll apply sigmoid ourselves
-        )
+        # Try to create model with pretrained weights, fall back to no weights if network fails
+        try:
+            self.model = model_class(
+                encoder_name=encoder_name,
+                encoder_weights=encoder_weights,
+                in_channels=3,
+                classes=num_classes,
+                activation=None,  # We'll apply sigmoid ourselves
+            )
+        except (OSError, urllib.error.URLError) as e:
+            print(f"Warning: Could not download pretrained weights ({e})")
+            print("Creating model without pretrained encoder weights")
+            self.model = model_class(
+                encoder_name=encoder_name,
+                encoder_weights=None,  # No pretrained weights
+                in_channels=3,
+                classes=num_classes,
+                activation=None,
+            )
 
         # Get preprocessing params for this encoder
         self.preprocess_params = smp.encoders.get_preprocessing_params(
@@ -117,11 +141,44 @@ class PretrainedRoadSegmentation(nn.Module):
         return preprocess
 
 
+def find_pretrained_weights(search_dirs: list[str] = None) -> Optional[Path]:
+    """
+    Search for existing pretrained weights in common locations.
+
+    Args:
+        search_dirs: List of directories to search
+
+    Returns:
+        Path to weights if found, None otherwise
+    """
+    if search_dirs is None:
+        search_dirs = ["checkpoints", "pretrained_models", "weights", "."]
+
+    for dir_path in search_dirs:
+        dir_path = Path(dir_path)
+        if not dir_path.exists():
+            continue
+
+        for name in KNOWN_CHECKPOINT_NAMES:
+            weights_path = dir_path / name
+            if weights_path.exists():
+                return weights_path
+
+        # Also search for any .pt/.pth files with 'road' or 'dlinknet' in name
+        for pattern in ["*road*.pt", "*road*.pth", "*dlinknet*.pt", "*dlinknet*.pth"]:
+            matches = list(dir_path.glob(pattern))
+            if matches:
+                return matches[0]
+
+    return None
+
+
 def create_pretrained_model(
     architecture: str = "linknet",
     encoder: str = "resnet34",
     checkpoint_path: Optional[str] = None,
     device: str = "cpu",
+    auto_find_weights: bool = True,
 ) -> nn.Module:
     """
     Create a road segmentation model with pretrained encoder.
@@ -131,6 +188,7 @@ def create_pretrained_model(
         encoder: Encoder backbone (resnet34, resnet50, efficientnet-b0, etc.)
         checkpoint_path: Optional path to fine-tuned weights
         device: Device to load model on
+        auto_find_weights: If True and no checkpoint_path, search for existing weights
 
     Returns:
         Model ready for inference or training
@@ -142,20 +200,51 @@ def create_pretrained_model(
         num_classes=1,
     )
 
+    # Auto-find weights if not specified
+    if not checkpoint_path and auto_find_weights:
+        found_path = find_pretrained_weights()
+        if found_path:
+            checkpoint_path = str(found_path)
+            print(f"Auto-found pretrained weights: {found_path}")
+
     if checkpoint_path:
         path = Path(checkpoint_path)
         if path.exists():
             print(f"Loading checkpoint from {path}")
-            checkpoint = torch.load(path, map_location=device, weights_only=False)
+            try:
+                checkpoint = torch.load(path, map_location=device, weights_only=False)
 
-            if 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
-            elif 'state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['state_dict'])
-            else:
-                model.load_state_dict(checkpoint)
+                if isinstance(checkpoint, dict):
+                    if 'model_state_dict' in checkpoint:
+                        state_dict = checkpoint['model_state_dict']
+                    elif 'state_dict' in checkpoint:
+                        state_dict = checkpoint['state_dict']
+                    else:
+                        state_dict = checkpoint
+                else:
+                    state_dict = checkpoint
 
-            print(f"Loaded fine-tuned weights from {path}")
+                # Try to load with strict=False to handle architecture mismatches
+                try:
+                    model.load_state_dict(state_dict, strict=True)
+                    print(f"Loaded fine-tuned weights (exact match)")
+                except RuntimeError:
+                    # Try loading just the inner model
+                    try:
+                        model.model.load_state_dict(state_dict, strict=False)
+                        print(f"Loaded fine-tuned weights (partial match to inner model)")
+                    except RuntimeError as e:
+                        print(f"Warning: Could not load weights: {e}")
+                        print(f"Using ImageNet pretrained encoder only")
+            except Exception as e:
+                print(f"Error loading checkpoint: {e}")
+                print(f"Using ImageNet pretrained encoder only")
+    else:
+        print(f"No fine-tuned weights found. Using ImageNet pretrained encoder.")
+        print(f"For better results, download pretrained weights or train on DeepGlobe:")
+        print(f"  1. Download: https://www.dropbox.com/sh/h62vr320eiy57tt/AAB5Tm43-efmtYzW_GFyUCfma")
+        print(f"     Save to checkpoints/dlinknet34_deepglobe.pt")
+        print(f"  2. Or train: python scripts/train_deepglobe.py --epochs 50")
 
     model = model.to(device).float()
     return model
