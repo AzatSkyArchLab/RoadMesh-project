@@ -20,13 +20,31 @@ try:
 except ImportError:
     SMP_AVAILABLE = False
 
+# Try to import huggingface_hub for model downloads
+try:
+    from huggingface_hub import hf_hub_download, HfApi
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
 
-# URLs for pretrained weights (community models)
+
+# HuggingFace models for satellite/road segmentation
+HF_MODELS = {
+    "satellite_segmentation": {
+        "repo_id": "abcd1334/Satellite_Segmentation",
+        "description": "Multi-class satellite segmentation (buildings, roads, vegetation, water)",
+    },
+    "aerial_roads_unet": {
+        "repo_id": "spectrewolf8/aerial-image-road-segmentation-with-U-NET-xp",
+        "description": "U-Net trained on Massachusetts Roads Dataset",
+    },
+}
+
+
+# URLs for pretrained weights (direct downloads)
 PRETRAINED_URLS = {
-    # D-LinkNet trained on DeepGlobe (if available)
-    "dlinknet_deepglobe": None,  # TODO: Add URL when available
-    # U-Net trained on Massachusetts Roads
-    "unet_massachusetts": None,  # TODO: Add URL when available
+    # D-LinkNet trained on DeepGlobe (from original authors)
+    "dlinknet_deepglobe": "https://www.dropbox.com/sh/h62vr320eiy57tt/AAB5Tm43-efmtYzW_GFyUCfma?dl=1",
 }
 
 
