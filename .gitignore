@@ -94,7 +94,6 @@ data/test_output/
 checkpoints/
 weights/
 /models/
-# But NOT the source code models:
 !src/roadmesh/models/
 
 # Logs
