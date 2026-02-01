@@ -1,8 +1,10 @@
 """
 RoadMesh Neural Network Architectures
 
-D-LinkNet34 implementation for road segmentation.
-Based on: https://github.com/zlkanata/DeepGlobe-Road-Extraction-Challenge
+Multiple architectures for road segmentation:
+- D-LinkNet34 (DeepGlobe winner)
+- UNet with various backbones (via segmentation_models_pytorch)
+- FPN, DeepLabV3+ and more
 """
 from __future__ import annotations
 
@@ -13,6 +15,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
+
+# Try to import segmentation_models_pytorch for additional architectures
+try:
+    import segmentation_models_pytorch as smp
+    SMP_AVAILABLE = True
+except ImportError:
+    SMP_AVAILABLE = False
+    print("[MODEL] segmentation_models_pytorch not installed. Run: pip install segmentation-models-pytorch")
 
 
 class Dblock(nn.Module):
@@ -240,32 +250,108 @@ def load_checkpoint(
     return model
 
 
+# Registry of available architectures
+ARCHITECTURE_REGISTRY = {
+    "dlinknet34": "D-LinkNet with ResNet34 (DeepGlobe winner)",
+    "unet_resnet34": "UNet with ResNet34 encoder",
+    "unet_resnet50": "UNet with ResNet50 encoder",
+    "unet_efficientnet-b3": "UNet with EfficientNet-B3 encoder",
+    "unet_efficientnet-b4": "UNet with EfficientNet-B4 encoder",
+    "fpn_resnet34": "FPN with ResNet34 encoder",
+    "fpn_resnet50": "FPN with ResNet50 encoder",
+    "deeplabv3plus_resnet50": "DeepLabV3+ with ResNet50 encoder",
+    "deeplabv3plus_efficientnet-b4": "DeepLabV3+ with EfficientNet-B4 encoder",
+}
+
+
+def list_architectures() -> dict[str, str]:
+    """List all available architectures."""
+    available = {"dlinknet34": ARCHITECTURE_REGISTRY["dlinknet34"]}
+
+    if SMP_AVAILABLE:
+        for name, desc in ARCHITECTURE_REGISTRY.items():
+            if name != "dlinknet34":
+                available[name] = desc
+
+    return available
+
+
 def create_model(
     architecture: str = "dlinknet34",
     num_classes: int = 1,
     pretrained: bool = True,
     checkpoint_path: Optional[str | Path] = None,
     device: str = "cpu",
+    encoder_weights: str = "imagenet",
 ) -> nn.Module:
     """
     Create and optionally load pretrained model.
 
     Args:
-        architecture: Model architecture ('dlinknet34', 'unet_resnet34')
+        architecture: Model architecture. Options:
+            - 'dlinknet34': D-LinkNet with ResNet34 (DeepGlobe)
+            - 'unet_resnet34': UNet with ResNet34
+            - 'unet_resnet50': UNet with ResNet50
+            - 'unet_efficientnet-b3': UNet with EfficientNet-B3
+            - 'fpn_resnet34': FPN with ResNet34
+            - 'deeplabv3plus_resnet50': DeepLabV3+ with ResNet50
         num_classes: Number of output classes
         pretrained: Whether to use pretrained backbone
         checkpoint_path: Optional path to trained weights
         device: Device to put model on
+        encoder_weights: Encoder pretrained weights ('imagenet' or None)
 
     Returns:
         Initialized model
     """
     print(f"[MODEL] Creating {architecture} model...")
+    arch_lower = architecture.lower()
 
-    if architecture.lower() == "dlinknet34":
+    if arch_lower == "dlinknet34":
         model = DLinkNet34(num_classes=num_classes, pretrained=pretrained)
+
+    elif arch_lower.startswith("unet_"):
+        if not SMP_AVAILABLE:
+            raise ImportError("segmentation_models_pytorch required. Run: pip install segmentation-models-pytorch")
+        encoder = arch_lower.replace("unet_", "")
+        weights = encoder_weights if pretrained else None
+        model = smp.Unet(
+            encoder_name=encoder,
+            encoder_weights=weights,
+            in_channels=3,
+            classes=num_classes,
+        )
+        print(f"[MODEL] Using UNet with {encoder} encoder")
+
+    elif arch_lower.startswith("fpn_"):
+        if not SMP_AVAILABLE:
+            raise ImportError("segmentation_models_pytorch required. Run: pip install segmentation-models-pytorch")
+        encoder = arch_lower.replace("fpn_", "")
+        weights = encoder_weights if pretrained else None
+        model = smp.FPN(
+            encoder_name=encoder,
+            encoder_weights=weights,
+            in_channels=3,
+            classes=num_classes,
+        )
+        print(f"[MODEL] Using FPN with {encoder} encoder")
+
+    elif arch_lower.startswith("deeplabv3plus_"):
+        if not SMP_AVAILABLE:
+            raise ImportError("segmentation_models_pytorch required. Run: pip install segmentation-models-pytorch")
+        encoder = arch_lower.replace("deeplabv3plus_", "")
+        weights = encoder_weights if pretrained else None
+        model = smp.DeepLabV3Plus(
+            encoder_name=encoder,
+            encoder_weights=weights,
+            in_channels=3,
+            classes=num_classes,
+        )
+        print(f"[MODEL] Using DeepLabV3+ with {encoder} encoder")
+
     else:
-        raise ValueError(f"Unknown architecture: {architecture}")
+        available = list(list_architectures().keys())
+        raise ValueError(f"Unknown architecture: {architecture}. Available: {available}")
 
     # Load checkpoint if provided
     if checkpoint_path:

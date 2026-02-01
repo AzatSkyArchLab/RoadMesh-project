@@ -52,6 +52,7 @@ class TrainRequest(BaseModel):
 class PredictRequest(BaseModel):
     bbox: BBox
     model_name: Optional[str] = None
+    architecture: str = "dlinknet34"
 
 
 # WebSocket for progress updates
@@ -131,7 +132,23 @@ async def list_models():
                 "size_mb": f.stat().st_size / 1024 / 1024,
                 "created": datetime.fromtimestamp(f.stat().st_mtime).isoformat()
             })
+        # Also check for .th files (some models use this extension)
+        for f in models_dir.glob("*.th"):
+            models.append({
+                "name": f.stem,
+                "path": str(f),
+                "size_mb": f.stat().st_size / 1024 / 1024,
+                "created": datetime.fromtimestamp(f.stat().st_mtime).isoformat()
+            })
     return {"models": models}
+
+
+@app.get("/api/architectures")
+async def list_architectures():
+    """List available model architectures."""
+    from roadmesh.models.architectures import list_architectures as get_archs
+    archs = get_archs()
+    return {"architectures": [{"name": k, "description": v} for k, v in archs.items()]}
 
 
 @app.get("/api/ground-truth")
@@ -308,25 +325,37 @@ async def run_inference(job_id: str, request: PredictRequest):
             await asyncio.sleep(0.1)
         
         await update(0, "Loading model...")
-        
+
         from roadmesh.core.config import BBox as BBoxConfig
         from roadmesh.data.tile_fetcher import TileFetcher
         from roadmesh.models.architectures import create_model
         from roadmesh.geometry.vectorizer import Vectorizer
-        
-        model_path = Path("checkpoints/best_model.pt")
+
+        # Determine model weights path
+        checkpoint_path = None
         if request.model_name:
-            model_path = Path(f"checkpoints/{request.model_name}.pt")
-        
-        if not model_path.exists():
-            await update(0, "No trained model found. Train first!", "failed")
-            return
-        
+            # Try different extensions
+            for ext in ['.pt', '.pth', '.th']:
+                model_path = Path(f"checkpoints/{request.model_name}{ext}")
+                if model_path.exists():
+                    checkpoint_path = str(model_path)
+                    break
+            # Also check if model_name includes extension
+            if not checkpoint_path:
+                model_path = Path(f"checkpoints/{request.model_name}")
+                if model_path.exists():
+                    checkpoint_path = str(model_path)
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"[PREDICT] Using device: {device}")
-        print(f"[PREDICT] Loading model from: {model_path}")
-        
-        model = create_model("dlinknet34", checkpoint_path=str(model_path), device=device)
+        print(f"[PREDICT] Architecture: {request.architecture}")
+        print(f"[PREDICT] Weights: {checkpoint_path or 'ImageNet pretrained'}")
+
+        model = create_model(
+            architecture=request.architecture,
+            checkpoint_path=checkpoint_path,
+            device=device
+        )
         model.eval()
         
         await update(10, "Fetching satellite tiles...")
@@ -526,7 +555,11 @@ async def index():
         <input type="number" id="epochs" value="10" min="1" max="200">
         <button class="btn btn-primary" id="btn-train" disabled>🧠 Train Model</button>
         <h3>3. DETECT ROADS</h3>
-        <label>Model:</label>
+        <label>Architecture:</label>
+        <select id="arch-select" style="width:100%;padding:8px;border:1px solid #444;border-radius:4px;background:#2d2d44;color:white;margin:5px 0;">
+            <option value="dlinknet34">D-LinkNet34 (DeepGlobe)</option>
+        </select>
+        <label>Weights:</label>
         <select id="model-select" style="width:100%;padding:8px;border:1px solid #444;border-radius:4px;background:#2d2d44;color:white;margin:5px 0;">
             <option value="best_model">Pretrained (best_model.pt)</option>
         </select>
@@ -662,31 +695,51 @@ async def index():
         btnPredict.onclick = async () => {
             if (!currentBbox) return;
             const modelName = document.getElementById('model-select').value;
+            const archName = document.getElementById('arch-select').value;
             progressContainer.style.display = 'block';
             progressFill.style.width = '0%';
-            setStatus('Starting detection with ' + modelName + '...', 'info');
+            setStatus('Starting detection with ' + archName + '...', 'info');
             await fetch('/api/predict', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({bbox: currentBbox, model_name: modelName})
+                body: JSON.stringify({bbox: currentBbox, model_name: modelName, architecture: archName})
             });
         };
+
+        // Load available architectures
+        async function loadArchitectures() {
+            try {
+                const resp = await fetch('/api/architectures');
+                const data = await resp.json();
+                const select = document.getElementById('arch-select');
+                select.innerHTML = '';
+                data.architectures.forEach(a => {
+                    const opt = document.createElement('option');
+                    opt.value = a.name;
+                    opt.textContent = a.description;
+                    select.appendChild(opt);
+                });
+            } catch (e) {
+                console.error('Failed to load architectures:', e);
+            }
+        }
 
         // Load available models
         async function loadModels() {
             const resp = await fetch('/api/models');
             const data = await resp.json();
             const select = document.getElementById('model-select');
-            select.innerHTML = '<option value="best_model">Pretrained (best_model.pt)</option>';
+            select.innerHTML = '<option value="">No weights (ImageNet only)</option>';
             data.models.forEach(m => {
-                if (m.name !== 'best_model') {
-                    const opt = document.createElement('option');
-                    opt.value = m.name;
-                    opt.textContent = m.name + ' (' + m.size_mb.toFixed(1) + ' MB)';
-                    select.appendChild(opt);
-                }
+                const opt = document.createElement('option');
+                opt.value = m.name;
+                opt.textContent = m.name + ' (' + m.size_mb.toFixed(1) + ' MB)';
+                if (m.name === 'best_model') opt.selected = true;
+                select.appendChild(opt);
             });
         }
+
+        loadArchitectures();
         loadModels();
     </script>
 </body>
