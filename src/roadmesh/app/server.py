@@ -508,6 +508,10 @@ async def index():
         <input type="number" id="epochs" value="10" min="1" max="200">
         <button class="btn btn-primary" id="btn-train" disabled>🧠 Train Model</button>
         <h3>3. DETECT ROADS</h3>
+        <label>Model:</label>
+        <select id="model-select" style="width:100%;padding:8px;border:1px solid #444;border-radius:4px;background:#2d2d44;color:white;margin:5px 0;">
+            <option value="best_model">Pretrained (best_model.pt)</option>
+        </select>
         <button class="btn btn-success" id="btn-predict" disabled>🔍 Detect Roads</button>
         <div class="progress-container" id="progress">
             <div class="progress-text" id="progress-message">Processing...</div>
@@ -639,15 +643,33 @@ async def index():
 
         btnPredict.onclick = async () => {
             if (!currentBbox) return;
+            const modelName = document.getElementById('model-select').value;
             progressContainer.style.display = 'block';
             progressFill.style.width = '0%';
-            setStatus('Starting detection...', 'info');
+            setStatus('Starting detection with ' + modelName + '...', 'info');
             await fetch('/api/predict', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({bbox: currentBbox})
+                body: JSON.stringify({bbox: currentBbox, model_name: modelName})
             });
         };
+
+        // Load available models
+        async function loadModels() {
+            const resp = await fetch('/api/models');
+            const data = await resp.json();
+            const select = document.getElementById('model-select');
+            select.innerHTML = '<option value="best_model">Pretrained (best_model.pt)</option>';
+            data.models.forEach(m => {
+                if (m.name !== 'best_model') {
+                    const opt = document.createElement('option');
+                    opt.value = m.name;
+                    opt.textContent = m.name + ' (' + m.size_mb.toFixed(1) + ' MB)';
+                    select.appendChild(opt);
+                }
+            });
+        }
+        loadModels();
     </script>
 </body>
 </html>"""
