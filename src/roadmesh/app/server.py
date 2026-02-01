@@ -335,10 +335,11 @@ async def run_inference(job_id: str, request: PredictRequest):
         fetcher = TileFetcher(provider="esri", cache_dir=Path("data/cache/tiles"))
         
         image, metadata = await fetcher.fetch_bbox_async(bbox_config, zoom=18)
+        original_height, original_width = image.shape[:2]
         print(f"[PREDICT] Fetched image: {image.shape}")
-        
+
         await update(40, "Running inference...")
-        
+
         img_resized = cv2.resize(image, (512, 512))
         img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
         img_tensor = img_tensor.to(device)  # Move to device first
@@ -390,20 +391,24 @@ async def run_inference(job_id: str, request: PredictRequest):
             # Save processed mask
             cv2.imwrite(str(debug_dir / f"{job_id}_mask.png"), mask * 255)
 
-        print(f"[PREDICT] Mask shape: {mask.shape}, road pixels: {mask.sum()}")
-        
+            # Scale mask back to original image size for accurate geo-coordinates
+            mask_fullsize = cv2.resize(mask, (original_width, original_height), interpolation=cv2.INTER_NEAREST)
+            cv2.imwrite(str(debug_dir / f"{job_id}_mask_fullsize.png"), mask_fullsize * 255)
+
+        print(f"[PREDICT] Mask shape: {mask.shape} -> scaled to {mask_fullsize.shape}, road pixels: {mask_fullsize.sum()}")
+
         await update(70, "Vectorizing results...")
-        
+
         vectorizer = Vectorizer()
-        polygons_px = vectorizer.mask_to_polygons(mask * 255)
-        
+        polygons_px = vectorizer.mask_to_polygons(mask_fullsize * 255)
+
         print(f"[PREDICT] Found {len(polygons_px)} polygons")
-        
+
         if polygons_px:
             polygons_geo = vectorizer.polygons_to_geo(
                 polygons_px,
                 bbox_config,
-                (mask.shape[1], mask.shape[0])
+                (original_width, original_height)  # Use original image dimensions
             )
             geojson = vectorizer.to_geojson(polygons_geo)
         else:
