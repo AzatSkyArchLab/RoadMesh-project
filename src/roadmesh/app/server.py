@@ -353,10 +353,42 @@ async def run_inference(job_id: str, request: PredictRequest):
                     output = model(img_tensor)
             else:
                 output = model(img_tensor)
-            
+
             pred = torch.sigmoid(output).squeeze().cpu().numpy()
-            mask = (pred > 0.5).astype(np.uint8)
-        
+
+            # Debug: save raw prediction
+            debug_dir = Path("data/predictions/debug")
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(debug_dir / f"{job_id}_raw_pred.png"), (pred * 255).astype(np.uint8))
+            cv2.imwrite(str(debug_dir / f"{job_id}_input.png"), cv2.cvtColor(img_resized, cv2.COLOR_RGB2BGR))
+
+            print(f"[PREDICT] Raw prediction - min: {pred.min():.3f}, max: {pred.max():.3f}, mean: {pred.mean():.3f}")
+
+            # Lower threshold for better road detection
+            threshold = 0.3
+            mask = (pred > threshold).astype(np.uint8)
+
+            print(f"[PREDICT] After threshold {threshold}: {mask.sum()} road pixels")
+
+            # Morphological post-processing
+            # 1. Close small gaps in roads
+            kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
+
+            # 2. Remove small noise
+            kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
+
+            # 3. Remove small connected components (noise)
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            min_area = 100  # minimum area in pixels
+            for i in range(1, num_labels):
+                if stats[i, cv2.CC_STAT_AREA] < min_area:
+                    mask[labels == i] = 0
+
+            # Save processed mask
+            cv2.imwrite(str(debug_dir / f"{job_id}_mask.png"), mask * 255)
+
         print(f"[PREDICT] Mask shape: {mask.shape}, road pixels: {mask.sum()}")
         
         await update(70, "Vectorizing results...")
