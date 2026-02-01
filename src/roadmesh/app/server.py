@@ -604,6 +604,8 @@ async def index():
         const progressPercent = document.getElementById('progress-percent');
 
         let ws = null;
+        let currentPredictJobId = null;
+
         function connectWS() {
             ws = new WebSocket('ws://' + window.location.host + '/ws');
             ws.onmessage = (e) => {
@@ -621,17 +623,38 @@ async def index():
             statusEl.className = 'status ' + (type || 'info');
         }
 
-        function updateProgress(data) {
+        async function updateProgress(data) {
             progressFill.style.width = data.progress + '%';
             progressPercent.textContent = Math.round(data.progress);
             progressMessage.textContent = data.message;
             if (data.status === 'completed') {
                 setStatus(data.message, 'success');
                 progressContainer.style.display = 'none';
-                if (data.result && data.result.geojson) showPredictions(data.result.geojson);
+                // Try to show predictions from WebSocket data first
+                if (data.result && data.result.geojson) {
+                    showPredictions(data.result.geojson);
+                } else if (data.job_id) {
+                    // Fallback: fetch predictions from API
+                    await loadPredictions(data.job_id);
+                }
             } else if (data.status === 'failed') {
                 setStatus(data.message, 'error');
                 progressContainer.style.display = 'none';
+            }
+        }
+
+        async function loadPredictions(jobId) {
+            try {
+                const resp = await fetch('/api/predictions/' + jobId);
+                const geojson = await resp.json();
+                if (geojson.features && geojson.features.length > 0) {
+                    showPredictions(geojson);
+                    setStatus('Loaded ' + geojson.features.length + ' road polygons', 'success');
+                } else {
+                    setStatus('No road polygons detected', 'info');
+                }
+            } catch (e) {
+                console.error('Failed to load predictions:', e);
             }
         }
 
@@ -675,8 +698,22 @@ async def index():
         }
 
         function showPredictions(geojson) {
+            console.log('Showing predictions:', geojson.features ? geojson.features.length : 0, 'features');
             if (predLayer) map.removeLayer(predLayer);
-            predLayer = L.geoJSON(geojson, {style: {color: '#ff0000', weight: 2, opacity: 0.9, fillColor: '#ff0000', fillOpacity: 0.4}}).addTo(map);
+            if (!geojson.features || geojson.features.length === 0) {
+                setStatus('No road polygons detected', 'info');
+                return;
+            }
+            predLayer = L.geoJSON(geojson, {
+                style: {color: '#ff0000', weight: 3, opacity: 1, fillColor: '#ff4444', fillOpacity: 0.5}
+            }).addTo(map);
+            // Fit map to show predictions
+            try {
+                const bounds = predLayer.getBounds();
+                if (bounds.isValid()) {
+                    map.fitBounds(bounds, {padding: [20, 20]});
+                }
+            } catch (e) {}
         }
 
         btnTrain.onclick = async () => {
