@@ -378,24 +378,28 @@ async def run_inference(job_id: str, request: PredictRequest):
 
             print(f"[PREDICT] Raw prediction - min: {pred.min():.3f}, max: {pred.max():.3f}, mean: {pred.mean():.3f}")
 
-            # Lower threshold for better road detection
-            threshold = 0.3
+            # Lower threshold - model confidence is often low for urban roads
+            threshold = 0.15
             mask = (pred > threshold).astype(np.uint8)
 
             print(f"[PREDICT] After threshold {threshold}: {mask.sum()} road pixels")
 
-            # Morphological post-processing
-            # 1. Close small gaps in roads
-            kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            # Morphological post-processing for better road connectivity
+            # 1. Close gaps in roads (larger kernel)
+            kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
 
-            # 2. Remove small noise
-            kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            # 2. Dilate to thicken thin roads
+            kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            mask = cv2.dilate(mask, kernel_dilate, iterations=1)
+
+            # 3. Remove small noise
+            kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
 
-            # 3. Remove small connected components (noise)
+            # 4. Remove small connected components (noise)
             num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-            min_area = 100  # minimum area in pixels
+            min_area = 50  # Lower to keep more roads
             for i in range(1, num_labels):
                 if stats[i, cv2.CC_STAT_AREA] < min_area:
                     mask[labels == i] = 0
