@@ -336,7 +336,19 @@ async def run_inference(job_id: str, request: PredictRequest):
         
         image, metadata = await fetcher.fetch_bbox_async(bbox_config, zoom=18)
         original_height, original_width = image.shape[:2]
+
+        # Use actual tile bounds (not requested bbox) for coordinate conversion
+        # This is the key fix for the offset issue!
+        actual_bounds = metadata["bounds"]
+        image_bbox = BBoxConfig(
+            minx=actual_bounds["west"],
+            miny=actual_bounds["south"],
+            maxx=actual_bounds["east"],
+            maxy=actual_bounds["north"]
+        )
         print(f"[PREDICT] Fetched image: {image.shape}")
+        print(f"[PREDICT] Requested bbox: {bbox.minx:.6f},{bbox.miny:.6f} -> {bbox.maxx:.6f},{bbox.maxy:.6f}")
+        print(f"[PREDICT] Actual bounds: {actual_bounds['west']:.6f},{actual_bounds['south']:.6f} -> {actual_bounds['east']:.6f},{actual_bounds['north']:.6f}")
 
         await update(40, "Running inference...")
 
@@ -407,8 +419,8 @@ async def run_inference(job_id: str, request: PredictRequest):
         if polygons_px:
             polygons_geo = vectorizer.polygons_to_geo(
                 polygons_px,
-                bbox_config,
-                (original_width, original_height)  # Use original image dimensions
+                image_bbox,  # Use actual tile bounds, not requested bbox!
+                (original_width, original_height)
             )
             geojson = vectorizer.to_geojson(polygons_geo)
         else:
