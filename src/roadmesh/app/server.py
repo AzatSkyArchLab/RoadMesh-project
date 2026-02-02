@@ -333,23 +333,38 @@ async def run_inference(job_id: str, request: PredictRequest):
 
         # Determine model weights path
         checkpoint_path = None
+        checkpoints_dir = Path("checkpoints")
+        checkpoints_dir.mkdir(exist_ok=True)
+
         if request.model_name:
             # Try different extensions
             for ext in ['.pt', '.pth', '.th']:
-                model_path = Path(f"checkpoints/{request.model_name}{ext}")
+                model_path = checkpoints_dir / f"{request.model_name}{ext}"
                 if model_path.exists():
                     checkpoint_path = str(model_path)
                     break
             # Also check if model_name includes extension
             if not checkpoint_path:
-                model_path = Path(f"checkpoints/{request.model_name}")
+                model_path = checkpoints_dir / request.model_name
                 if model_path.exists():
                     checkpoint_path = str(model_path)
+
+            # Warn if requested model not found
+            if not checkpoint_path:
+                available_models = list(checkpoints_dir.glob("*.pt")) + list(checkpoints_dir.glob("*.pth")) + list(checkpoints_dir.glob("*.th"))
+                if available_models:
+                    available_names = [m.stem for m in available_models]
+                    await update(0, f"Model '{request.model_name}' not found. Available: {available_names}", "failed")
+                else:
+                    await update(0, f"No models in checkpoints/. Copy best_model.pt or train a new model!", "failed")
+                return
+        else:
+            await update(5, "Using ImageNet pretrained backbone (no road-specific weights)")
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"[PREDICT] Using device: {device}")
         print(f"[PREDICT] Architecture: {request.architecture}")
-        print(f"[PREDICT] Weights: {checkpoint_path or 'ImageNet pretrained'}")
+        print(f"[PREDICT] Weights: {checkpoint_path or 'ImageNet backbone only'}")
 
         model = create_model(
             architecture=request.architecture,
