@@ -203,12 +203,14 @@ def load_checkpoint(
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
     print(f"[MODEL] Loading checkpoint: {checkpoint_path}")
+    print(f"[MODEL] File size: {checkpoint_path.stat().st_size / 1024 / 1024:.1f} MB")
 
     # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # Extract state_dict from different formats
     if isinstance(checkpoint, dict):
+        print(f"[MODEL] Checkpoint keys: {list(checkpoint.keys())[:10]}...")
         if "state_dict" in checkpoint:
             state_dict = checkpoint["state_dict"]
         elif "model_state_dict" in checkpoint:
@@ -221,6 +223,16 @@ def load_checkpoint(
     else:
         state_dict = checkpoint
 
+    print(f"[MODEL] State dict has {len(state_dict)} keys")
+
+    # Show first few keys from checkpoint
+    ckpt_keys = list(state_dict.keys())[:5]
+    print(f"[MODEL] Checkpoint first keys: {ckpt_keys}")
+
+    # Show first few keys from model
+    model_keys = list(model.state_dict().keys())[:5]
+    print(f"[MODEL] Model first keys: {model_keys}")
+
     # Clean up keys (remove 'module.' prefix from DataParallel)
     new_state_dict = {}
     for k, v in state_dict.items():
@@ -229,17 +241,23 @@ def load_checkpoint(
         else:
             new_state_dict[k] = v
 
+    # Check key overlap
+    model_dict = model.state_dict()
+    matched_keys = set(new_state_dict.keys()) & set(model_dict.keys())
+    print(f"[MODEL] Matched keys: {len(matched_keys)}/{len(model_dict)}")
+
     # Load weights
     try:
         missing, unexpected = model.load_state_dict(new_state_dict, strict=strict)
         if missing:
-            print(f"[MODEL] Missing keys: {len(missing)}")
+            print(f"[MODEL] Missing keys ({len(missing)}): {missing[:3]}...")
         if unexpected:
-            print(f"[MODEL] Unexpected keys: {len(unexpected)}")
+            print(f"[MODEL] Unexpected keys ({len(unexpected)}): {unexpected[:3]}...")
+        if not missing and not unexpected:
+            print(f"[MODEL] All keys matched perfectly!")
     except Exception as e:
         print(f"[MODEL] Warning: Could not load all weights: {e}")
         # Try to load what we can
-        model_dict = model.state_dict()
         pretrained_dict = {k: v for k, v in new_state_dict.items()
                           if k in model_dict and v.shape == model_dict[k].shape}
         model_dict.update(pretrained_dict)
