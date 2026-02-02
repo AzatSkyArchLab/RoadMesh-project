@@ -136,12 +136,12 @@ class DLinkNet34(nn.Module):
         self.decoder2 = DecoderBlock(128, 64)
         self.decoder1 = DecoderBlock(64, 64)
 
-        # Final layers - must match original D-LinkNet exactly!
-        self.finaldeconv1 = nn.ConvTranspose2d(64, 32, 3, stride=2)
+        # Final layers
+        self.finaldeconv1 = nn.ConvTranspose2d(64, 32, 4, 2, 1)
         self.finalrelu1 = nn.ReLU(inplace=True)
-        self.finalconv2 = nn.Conv2d(32, 32, 3)
+        self.finalconv2 = nn.Conv2d(32, 32, 3, padding=1)
         self.finalrelu2 = nn.ReLU(inplace=True)
-        self.finalconv3 = nn.Conv2d(32, num_classes, 2, padding=1)
+        self.finalconv3 = nn.Conv2d(32, num_classes, 3, padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Encoder
