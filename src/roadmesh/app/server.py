@@ -422,8 +422,8 @@ async def run_inference(job_id: str, request: PredictRequest):
 
             print(f"[PREDICT] Raw prediction - min: {pred.min():.3f}, max: {pred.max():.3f}, mean: {pred.mean():.3f}")
 
-            # Threshold for road detection (higher = more strict)
-            threshold = 0.5
+            # Threshold for road detection
+            threshold = 0.3
             mask = (pred > threshold).astype(np.uint8)
 
             print(f"[PREDICT] After threshold {threshold}: {mask.sum()} road pixels")
